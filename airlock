@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# airlock — a disposable, hardened Linux sandbox for running untrusted code and
+# deploying with throwaway CLI logins. Two modes:
+#
+#   airlock run [CMD]   UNTRUSTED mode: no host secrets, locked-down, egress
+#                       only through a domain whitelist proxy. For OSS you don't
+#                       trust. (alias: `airlock shell`)
+#   airlock dev [CMD]   TRUSTED mode: your Claude login works, full internet.
+#                       For your own code.
+#
+#   airlock exec [CMD]  open ANOTHER terminal into the running sandbox
+#   airlock allow DOM   add a domain to the egress whitelist (then rebuild)
+#   airlock down        stop & remove sandbox + proxy containers
+#   airlock status      show images, running containers, whitelist
+#   airlock build       (re)build the images
+#   airlock rebuild     rebuild from scratch (no cache)
+#   airlock logs        follow proxy logs (see what egress is allowed/blocked)
+#   airlock help        this help   (also: --help, -h)
+#
+# run/dev are throwaway (--rm): each spin is fresh. Ports 3000/3001/5173/4000/8080
+# are published to the host so dev servers are reachable (bind to 0.0.0.0!).
+set -euo pipefail
+
+# Directory you invoked airlock from -> becomes /workspace. Capture before cd.
+INVOKE_DIR="$PWD"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+SANDBOX_IMAGE="syedtasavour/airlock-sandbox:latest"
+PROXY_IMAGE="syedtasavour/airlock-proxy:latest"
+FILTER="$DIR/proxy/filter"
+
+dc() { docker compose "$@"; }
+image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+
+ensure_built() {
+  if ! image_exists "$SANDBOX_IMAGE"; then
+    echo "› images not found — building (first time only)…"
+    dc --profile run --profile dev build
+  fi
+}
+
+# Mount the dir you ran airlock from as /workspace. Refuse overly-broad roots.
+set_workspace() {
+  if [ "$INVOKE_DIR" = "$HOME" ] || [ "$INVOKE_DIR" = "/" ]; then
+    echo "✗ refusing to mount '$INVOKE_DIR' (too broad). cd into a project first."
+    exit 1
+  fi
+  export WORKSPACE="$INVOKE_DIR"
+  echo "› workspace: $WORKSPACE  →  /workspace"
+}
+
+# Export Claude login from the macOS Keychain into a local read-only file so
+# DEV mode can reuse it. Only ever read by the container; refreshes stay inside.
+sync_claude_creds() {
+  local secrets="$DIR/.secrets" file
+  file="$secrets/.credentials.json"
+  mkdir -p "$secrets"; chmod 700 "$secrets"
+  if security find-generic-password -s "Claude Code-credentials" -w \
+       > "$file" 2>/dev/null && [ -s "$file" ]; then
+    chmod 600 "$file"
+    echo "› Claude login synced from Keychain (read-only into sandbox)"
+  else
+    : > "$file"
+    echo "› note: couldn't read Claude login from Keychain — run /login inside if needed"
+  fi
+}
+
+# Find the running sandbox container (untrusted or dev), excluding the proxy.
+running_sandbox() {
+  docker ps --format '{{.ID}} {{.Names}}' \
+    | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' | head -1
+}
+
+print_help() {
+  awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  run|shell)
+    ensure_built
+    set_workspace
+    sync_claude_creds
+    echo "› UNTRUSTED mode — only Claude token mounted; egress via whitelist proxy"
+    echo "› ports 3000/3001/5173/4000/8080 published to host"
+    if [ "$#" -eq 0 ]; then
+      dc --profile run run --rm --service-ports untrusted bash
+    else
+      dc --profile run run --rm --service-ports untrusted "$@"
+    fi
+    ;;
+
+  dev)
+    ensure_built
+    set_workspace
+    sync_claude_creds
+    echo "› DEV mode — Claude login seeded; full internet"
+    echo "› ports 3000/3001/5173/4000/8080 published to host"
+    if [ "$#" -eq 0 ]; then
+      dc --profile dev run --rm --service-ports dev bash
+    else
+      dc --profile dev run --rm --service-ports dev "$@"
+    fi
+    ;;
+
+  exec)
+    cid="$(running_sandbox || true)"
+    if [ -z "${cid:-}" ]; then
+      echo "✗ no running sandbox — start one first: airlock run   (or: airlock dev)"
+      exit 1
+    fi
+    echo "› attaching to running sandbox $cid"
+    if [ "$#" -eq 0 ]; then docker exec -it "$cid" bash; else docker exec -it "$cid" "$@"; fi
+    ;;
+
+  allow)
+    [ "$#" -ge 1 ] || { echo "usage: airlock allow <domain>   e.g. airlock allow example.com"; exit 1; }
+    dom="$1"
+    # Escape dots, anchor to end-of-host so subdomains of it match.
+    printf '\\.%s$\n' "$(echo "$dom" | sed 's/^\*\.//; s/\./\\./g')" >> "$FILTER"
+    echo "› added '$dom' to whitelist. Rebuild to apply:  airlock rebuild"
+    ;;
+
+  down)
+    echo "› stopping sandbox + proxy…"
+    dc --profile run --profile dev down --remove-orphans >/dev/null 2>&1 || true
+    docker ps -a --format '{{.ID}} {{.Names}}' \
+      | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' \
+      | xargs -r docker rm -f >/dev/null 2>&1 || true
+    echo "› done"
+    ;;
+
+  status)
+    echo "images:"
+    for img in "$SANDBOX_IMAGE" "$PROXY_IMAGE"; do
+      if image_exists "$img"; then echo "  ✓ $img"; else echo "  ✗ $img (run: airlock build)"; fi
+    done
+    echo ""
+    echo "running now:"
+    found=0
+    while IFS=$'\t' read -r name st; do
+      [ -z "$name" ] && continue
+      found=1
+      case "$name" in
+        *untrusted*) echo "  🔒 SAFE     $name" ; echo "             UNTRUSTED — no history, network = whitelist only   ($st)" ;;
+        *dev*)       echo "  ⚠️  TRUSTED  $name" ; echo "             DEV — your Claude history + FULL internet           ($st)" ;;
+        *proxy*)     echo "  🛡️  proxy    $name   (egress whitelist)                       ($st)" ;;
+        *)           echo "  •  $name   ($st)" ;;
+      esac
+    done < <(docker ps --filter "name=airlock" --format '{{.Names}}\t{{.Status}}')
+    [ "$found" = 0 ] && echo "  (nothing running — sandboxes are disposable, this is normal)"
+    echo ""
+    echo "egress whitelist ($FILTER):"
+    grep -vE '^\s*#|^\s*$' "$FILTER" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+    ;;
+
+  build)   dc --profile run --profile dev build "$@" ;;
+  rebuild) dc --profile run --profile dev build --no-cache "$@" ;;
+  logs)    docker logs -f airlock-proxy ;;
+
+  help|-h|--help) print_help ;;
+  *) echo "unknown command: $cmd"; echo "try: airlock --help"; exit 1 ;;
+esac

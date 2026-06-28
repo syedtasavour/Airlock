@@ -1,0 +1,39 @@
+# airlock egress whitelist — one extended-regex per line, matched against the
+# destination HOST. Anything not listed here is BLOCKED for the sandbox.
+# Add domains with:  airlock allow <domain>   (or edit this file, then rebuild).
+# Lines starting with # are comments.
+
+# --- package registries (so projects can install deps) ---
+\.npmjs\.org$
+^registry\.yarnpkg\.com$
+\.yarnpkg\.com$
+\.pypi\.org$
+^pypi\.org$
+\.pythonhosted\.org$
+^crates\.io$
+\.crates\.io$
+^static\.crates\.io$
+
+# --- source / git hosting ---
+^github\.com$
+\.github\.com$
+\.githubusercontent\.com$
+^codeload\.github\.com$
+\.gitlab\.com$
+
+# --- deploy targets ---
+\.vercel\.com$
+^vercel\.com$
+\.herokuapp\.com$
+\.heroku\.com$
+\.netlify\.com$
+\.netlify\.app$
+\.cloudflare\.com$
+\.workers\.dev$
+\.firebaseio\.com$
+\.googleapis\.com$
+
+# --- Claude / Anthropic (only relevant in dev mode) ---
+\.anthropic\.com$
+^api\.anthropic\.com$
+\.claude\.ai$

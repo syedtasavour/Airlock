@@ -1,0 +1,98 @@
+# airlock — two isolation profiles over one hardened image.
+#
+#   run  (profile: run)  -> UNTRUSTED projects. No host secrets. No direct
+#                           internet: egress only via the whitelist proxy.
+#   dev  (profile: dev)  -> YOUR code. Claude login seeded in. Full internet.
+#
+# Use via the `airlock` wrapper, which sets WORKSPACE + the right profile.
+
+# Shared hardening applied to both sandbox profiles.
+x-sandbox-common: &sandbox-common
+  image: syedtasavour/airlock-sandbox:latest
+  build:
+    context: .
+  stdin_open: true
+  tty: true
+
+  # cannot write to the root filesystem; only the tmpfs mounts below are writable
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+  # writable scratch (RAM-backed, wiped on stop)
+  tmpfs:
+    - /tmp:size=256m
+    - /home/node:exec,uid=1000,gid=1000,size=1g
+
+  # resource caps: blunt the impact of fork bombs / runaway untrusted code
+  mem_limit: 4g
+  cpus: 4
+  pids_limit: 512
+
+  working_dir: /workspace
+
+  # dev-server ports forwarded to the host (published only with --service-ports)
+  ports:
+    - "3000:3000"   # Next.js / CRA
+    - "3001:3001"   # second app
+    - "5173:5173"   # Vite
+    - "4000:4000"   # misc
+    - "8080:8080"   # misc / proxies
+
+services:
+  # ---- egress whitelist proxy (only started for the `run` profile) ----------
+  proxy:
+    build:
+      context: ./proxy
+    image: syedtasavour/airlock-proxy:latest
+    container_name: airlock-proxy
+    profiles: [run]
+    networks: [egress, isolated]
+    restart: unless-stopped
+
+  # ---- UNTRUSTED mode -------------------------------------------------------
+  untrusted:
+    <<: *sandbox-common
+    profiles: [run]
+    # ONLY the internal network -> no direct route to the internet.
+    networks: [isolated]
+    depends_on: [proxy]
+    environment:
+      - HOME=/home/node
+      - AIRLOCK_SEED_CLAUDE=1      # log Claude in (token only — see volumes)
+      # force all egress through the whitelist proxy
+      - HTTP_PROXY=http://proxy:8888
+      - HTTPS_PROXY=http://proxy:8888
+      - http_proxy=http://proxy:8888
+      - https_proxy=http://proxy:8888
+      - NO_PROXY=localhost,127.0.0.1,proxy
+      - no_proxy=localhost,127.0.0.1,proxy
+    volumes:
+      # The project you opened.
+      - ${WORKSPACE:-.}:/workspace
+      # ONLY the Claude login token — NOT your ~/.claude history or .claude.json.
+      # Claude works; your past conversations stay off the untrusted box.
+      - ./.secrets/.credentials.json:/host-claude-creds.json:ro
+
+  # ---- DEV (trusted) mode ---------------------------------------------------
+  dev:
+    <<: *sandbox-common
+    profiles: [dev]
+    networks: [egress]            # full internet
+    environment:
+      - HOME=/home/node
+      - AIRLOCK_SEED_CLAUDE=1      # seed Claude login/session
+    volumes:
+      - ${WORKSPACE:-.}:/workspace
+      # Claude host login/session, READ-ONLY, copied into the ephemeral home.
+      - ${HOME}/.claude:/host-claude:ro
+      - ${HOME}/.claude.json:/host-claude.json:ro
+      - ./.secrets/.credentials.json:/host-claude-creds.json:ro
+
+networks:
+  egress:
+    driver: bridge        # normal bridge -> reaches the internet
+  isolated:
+    internal: true        # no gateway -> containers here can't reach the internet

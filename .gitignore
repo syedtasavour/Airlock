@@ -1,0 +1,11 @@
+# Secrets — NEVER commit. Contains the exported Claude login token.
+.secrets/
+*.credentials.json
+.credentials.json
+
+# macOS
+.DS_Store
+
+# Local artifacts
+*.dmg
+*.log
