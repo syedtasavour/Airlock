@@ -59,15 +59,16 @@ ensure_built() {
 # Mount the dir you ran airlock from as /workspace. Refuse overly-broad roots.
 set_workspace() {
   if [ "$INVOKE_DIR" = "$HOME" ] || [ "$INVOKE_DIR" = "/" ]; then
-    echo "✗ refusing to mount '$INVOKE_DIR' (too broad). cd into a project first."
+    echo "${R}✗ refusing to mount '$INVOKE_DIR' (too broad). cd into a project first.${N}"
     exit 1
   fi
   export WORKSPACE="$INVOKE_DIR"
-  echo "› workspace: $WORKSPACE  →  /workspace"
 }
 
-# Export Claude login from the macOS Keychain into a local read-only file so
-# DEV mode can reuse it. Only ever read by the container; refreshes stay inside.
+# Export Claude login from the macOS Keychain into a local read-only file so the
+# sandbox can reuse it. Only ever read by the container; refreshes stay inside.
+# Sets CLAUDE_STATE (a colored summary) for the launch banner.
+CLAUDE_STATE=""
 sync_claude_creds() {
   local secrets="$DIR/.secrets" file
   file="$secrets/.credentials.json"
@@ -75,11 +76,40 @@ sync_claude_creds() {
   if security find-generic-password -s "Claude Code-credentials" -w \
        > "$file" 2>/dev/null && [ -s "$file" ]; then
     chmod 600 "$file"
-    echo "› Claude login synced from Keychain (read-only into sandbox)"
+    CLAUDE_STATE="${G}logged in${N} ${DIM}(synced from your Keychain)${N}"
   else
     : > "$file"
-    echo "› note: couldn't read Claude login from Keychain — run /login inside if needed"
+    CLAUDE_STATE="${Y}not logged in${N} ${DIM}(run /login inside, or set ANTHROPIC_API_KEY)${N}"
   fi
+}
+
+# Polished launch banner. Adapts to terminal: colored on a TTY, plain when piped.
+# $1 = mode (run|dev)
+launch_banner() {
+  local mode="$1" wl
+  wl="$(readable_whitelist | wc -l | tr -d ' ')"
+  echo ""
+  hr
+  if [ "$mode" = run ]; then
+    echo "  🔒 ${B}${G}airlock · UNTRUSTED${N}   ${DIM}safe — locked-down sandbox${N}"
+  else
+    echo "  ⚠  ${B}${Y}airlock · DEV${N}   ${DIM}trusted — full access, for your own code${N}"
+  fi
+  hr
+  echo "  ${B}path${N}      ${C}${WORKSPACE}${N}"
+  echo "            ${DIM}↳ mounted at /workspace — the only host folder the box can see${N}"
+  if [ "$mode" = run ]; then
+    echo "  ${B}network${N}   ${G}whitelist only${N} ${DIM}· ${wl} domains allowed, everything else blocked${N}"
+    echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· Claude token only, no history${N}"
+  else
+    echo "  ${B}network${N}   ${Y}full internet${N}"
+    echo "  ${B}secrets${N}   ${Y}Claude login + history${N} ${DIM}· trusted mode${N}"
+  fi
+  echo "  ${B}ports${N}     ${DIM}3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac${N}"
+  echo "  ${B}claude${N}    ${CLAUDE_STATE}"
+  hr
+  echo "  ${DIM}type 'exit' to leave — the container is destroyed (fresh next spin)${N}"
+  echo ""
 }
 
 # Find the running sandbox container (untrusted or dev), excluding the proxy.
@@ -131,8 +161,7 @@ case "$cmd" in
     ensure_built
     set_workspace
     sync_claude_creds
-    echo "› UNTRUSTED mode — only Claude token mounted; egress via whitelist proxy"
-    echo "› ports 3000/3001/5173/4000/8080 published to host"
+    launch_banner run
     if [ "$#" -eq 0 ]; then
       dc --profile run run --rm --service-ports untrusted bash
     else
@@ -144,8 +173,7 @@ case "$cmd" in
     ensure_built
     set_workspace
     sync_claude_creds
-    echo "› DEV mode — Claude login seeded; full internet"
-    echo "› ports 3000/3001/5173/4000/8080 published to host"
+    launch_banner dev
     if [ "$#" -eq 0 ]; then
       dc --profile dev run --rm --service-ports dev bash
     else
