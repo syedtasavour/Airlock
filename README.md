@@ -178,13 +178,40 @@ airlock help        show help   (also --help, -h)
 Pass a one-off command instead of a shell: `airlock run npm test`,
 `airlock dev claude`, `airlock exec vercel deploy`.
 
-`airlock status` labels each running box so you always know what you're in:
+### Every launch tells you where you are
+
+`airlock run` / `airlock dev` print a banner so you always know the mode, the
+exact host path mounted, the network policy, and your login state. Colors show
+on a terminal and auto-disable when piped.
 
 ```
-running now:
-  🔒 SAFE     airlock-untrusted-run-…   UNTRUSTED — no history, network = whitelist only
-  ⚠️  TRUSTED  airlock-dev-run-…         DEV — your Claude history + FULL internet
-  🛡️  proxy    airlock-proxy             (egress whitelist)
+  ────────────────────────────────────────────────────
+  🔒 airlock · UNTRUSTED   safe — locked-down sandbox
+  ────────────────────────────────────────────────────
+  path      /Users/you/some/oss-project
+            ↳ mounted at /workspace — the only host folder the box can see
+  network   whitelist only · 27 domains allowed, everything else blocked
+  secrets   none of your files · Claude token only, no history
+  ports     3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac
+  claude    logged in (synced from your Keychain)
+  ────────────────────────────────────────────────────
+  type 'exit' to leave — the container is destroyed (fresh next spin)
+```
+
+### `airlock status`
+
+A dashboard of images, what's running (labelled 🔒 SAFE / ⚠ TRUSTED), the two
+modes, and the network whitelist shown as **readable domains** (not regex):
+
+```
+  Running now
+    🔒 SAFE     airlock-untrusted-run-…   · untrusted · whitelist net · Up 5s
+
+  Network whitelist  · 27 domains reachable in 'run' mode; all others blocked
+    *.npmjs.org                   github.com
+    *.github.com                  registry.yarnpkg.com
+    *.vercel.com                  api.anthropic.com
+    …
 ```
 
 ---
