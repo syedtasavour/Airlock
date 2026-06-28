@@ -45,7 +45,8 @@ echo "✓ Docker is installed and running"
 mkdir -p "$DIR/.secrets"; chmod 700 "$DIR/.secrets"
 [ -f "$DIR/.secrets/.credentials.json" ] || : > "$DIR/.secrets/.credentials.json"
 chmod 600 "$DIR/.secrets/.credentials.json"
-echo "✓ .secrets ready"
+mkdir -p "$DIR/.logs"   # proxy logs for `airlock blocked`
+echo "✓ .secrets + .logs ready"
 
 # 3) make scripts executable --------------------------------------------------
 chmod +x "$DIR/airlock" "$DIR/entrypoint.sh" "$DIR/in-container.sh" "$DIR/setup.sh" 2>/dev/null || true

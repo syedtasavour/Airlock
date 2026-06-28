@@ -176,11 +176,12 @@ airlock run [CMD]   UNTRUSTED mode — no history, whitelist-only network
 airlock dev [CMD]   TRUSTED mode — Claude login + full internet
 airlock exec [CMD]  open ANOTHER terminal into the running sandbox
 airlock allow DOM   add a domain to the egress whitelist (then rebuild)
+airlock blocked     list the URLs/hosts the proxy denied (not whitelisted)
 airlock down        stop & remove sandbox + proxy containers
 airlock status      show images, what's running, and whether it's SAFE
 airlock build       (re)build the images
 airlock rebuild     rebuild from scratch (no cache)
-airlock logs        follow proxy logs (watch what's allowed/blocked)
+airlock logs        follow proxy logs live (watch what's allowed/blocked)
 airlock help        show help   (also --help, -h)
 ```
 
@@ -241,10 +242,17 @@ example.com           -> 403 blocked
 anything-not-listed   -> 403 blocked
 ```
 
-Add a domain:
+See what got blocked, then allow what you trust:
 ```bash
+airlock blocked          # lists denied hosts as URLs (works after exit too)
 airlock allow files.example.com
 airlock rebuild          # bake the new whitelist into the proxy image
+```
+Example `airlock blocked` output:
+```
+  Denied — not on the whitelist:
+    ✗ https://tracker.evil-test.io     1×
+    ✗ https://some-cdn.attacker.net    1×
 ```
 
 Default whitelist: npm / yarn / pip / cargo, GitHub / GitLab, common deploy

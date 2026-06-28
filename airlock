@@ -118,11 +118,25 @@ running_sandbox() {
     | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' | head -1
 }
 
+# Proxy log: live container if running, else the saved last-session log.
+proxy_log() {
+  if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then
+    docker logs airlock-proxy 2>&1
+  elif [ -f "$DIR/.logs/proxy-last.log" ]; then
+    cat "$DIR/.logs/proxy-last.log"
+  fi
+}
+
 # Tear down the proxy + networks, but ONLY if no other sandbox is still running
 # (so a 2nd `airlock exec`/`run` terminal doesn't lose its network).
 teardown_proxy_if_idle() {
   if docker ps --format '{{.Names}}' | grep -qE 'airlock-(untrusted|dev)-run'; then
     return 0   # another sandbox is live — leave the proxy up for it
+  fi
+  # Persist the proxy log so `airlock blocked` still works after teardown.
+  if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then
+    mkdir -p "$DIR/.logs"
+    docker logs airlock-proxy > "$DIR/.logs/proxy-last.log" 2>&1 || true
   fi
   echo "${DIM}› tearing down proxy + isolated network…${N}"
   dc --profile run down --remove-orphans >/dev/null 2>&1 || true
@@ -142,7 +156,8 @@ print_help() {
 
   ${B}NETWORK${N}
     allow <domain>   permit a domain in 'run' mode, then run: airlock rebuild
-    logs             watch what the proxy allows / blocks
+    blocked          list the URLs/hosts the proxy denied (not whitelisted)
+    logs             watch what the proxy allows / blocks (live)
 
   ${B}MANAGE${N}
     status           what's running, and whether it's safe
@@ -267,6 +282,23 @@ case "$cmd" in
     hr
     ;;
 
+  blocked)
+    if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then src="live"; else src="last session"; fi
+    echo ""
+    hr; echo "  ${B}airlock — blocked egress${N}  ${DIM}· ${src}${N}"; hr
+    blk="$(proxy_log | sed -nE 's/.*Proxying refused on filtered domain "([^"]+)".*/\1/p' | sort | uniq -c | sort -rn)"
+    if [ -z "$blk" ]; then
+      echo "    ${G}nothing blocked${N} ${DIM}— no denied requests recorded${N}"
+    else
+      echo "  ${B}Denied — not on the whitelist:${N}"
+      printf '%s\n' "$blk" | while read -r n host; do
+        printf "    ${R}✗${N} ${C}https://%s${N}%*s${DIM}%s×${N}\n" "$host" $(( 34 - ${#host} > 1 ? 34 - ${#host} : 1 )) "" "$n"
+      done
+      echo ""
+      echo "    ${DIM}to permit one:${N} airlock allow <domain>   ${DIM}then${N} airlock rebuild"
+    fi
+    hr
+    ;;
   build)   dc --profile run --profile dev build "$@" ;;
   rebuild) dc --profile run --profile dev build --no-cache "$@" ;;
   logs)    docker logs -f airlock-proxy ;;
