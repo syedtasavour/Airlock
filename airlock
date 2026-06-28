@@ -30,6 +30,22 @@ SANDBOX_IMAGE="syedtasavour/airlock-sandbox:latest"
 PROXY_IMAGE="syedtasavour/airlock-proxy:latest"
 FILTER="$DIR/proxy/filter"
 
+# Colors (disabled when output isn't a terminal, e.g. piped).
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'
+  C=$'\033[36m'; R=$'\033[31m'; N=$'\033[0m'
+else
+  B=""; DIM=""; G=""; Y=""; C=""; R=""; N=""
+fi
+hr() { printf '  %s\n' "${DIM}────────────────────────────────────────────────────${N}"; }
+
+# Turn the proxy regex filter into human-readable domains:
+#   \.npmjs\.org$ -> *.npmjs.org      ^github\.com$ -> github.com
+readable_whitelist() {
+  grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$FILTER" 2>/dev/null \
+    | sed -E 's/\$$//; s/^\^//; s/^\\\./*./; s/\\\././g' | sort -u
+}
+
 dc() { docker compose "$@"; }
 image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
 
@@ -73,7 +89,39 @@ running_sandbox() {
 }
 
 print_help() {
-  awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "${BASH_SOURCE[0]}"
+  cat <<EOF
+  ${B}airlock${N} — disposable hardened sandbox for running untrusted code & deploying
+
+  ${B}USAGE${N}
+    airlock <command> [args]
+
+  ${B}ENTER A SANDBOX${N}
+    ${G}run${N} [cmd]        🔒 untrusted code — no history, whitelist-only network
+    ${Y}dev${N} [cmd]        ⚠  your own code — Claude login + full internet
+    exec [cmd]       open another terminal into the running sandbox
+
+  ${B}NETWORK${N}
+    allow <domain>   permit a domain in 'run' mode, then run: airlock rebuild
+    logs             watch what the proxy allows / blocks
+
+  ${B}MANAGE${N}
+    status           what's running, and whether it's safe
+    down             stop & remove the sandbox + proxy
+    build            build images
+    rebuild          build images from scratch (no cache)
+
+  ${B}INFO${N}
+    help             this help   (also: --help, -h)
+
+  ${B}EXAMPLES${N}
+    ${DIM}cd ~/some/oss && airlock run${N}        run sketchy code safely
+    ${DIM}cd ~/CodeBase/app && airlock dev${N}    your code, with Claude
+    ${DIM}airlock run npm test${N}                one-off command
+    ${DIM}airlock allow files.example.com${N}     widen the whitelist
+
+  ${DIM}The folder you launch from becomes /workspace — the only host folder the
+  sandbox sees. Bind dev servers to 0.0.0.0 to reach them at localhost on your Mac.${N}
+EOF
 }
 
 cmd="${1:-help}"; shift || true
@@ -133,27 +181,48 @@ case "$cmd" in
     ;;
 
   status)
-    echo "images:"
-    for img in "$SANDBOX_IMAGE" "$PROXY_IMAGE"; do
-      if image_exists "$img"; then echo "  ✓ $img"; else echo "  ✗ $img (run: airlock build)"; fi
-    done
     echo ""
-    echo "running now:"
+    hr; echo "  ${B}airlock — status${N}"; hr
+    echo ""
+
+    # ---- images ----
+    echo "  ${B}Images${N}"
+    if image_exists "$SANDBOX_IMAGE"; then echo "    ${G}✓${N} sandbox   ${DIM}${SANDBOX_IMAGE}${N}"
+    else echo "    ${R}✗${N} sandbox   ${DIM}${SANDBOX_IMAGE}${N}   ${Y}→ run: airlock build${N}"; fi
+    if image_exists "$PROXY_IMAGE"; then echo "    ${G}✓${N} proxy     ${DIM}${PROXY_IMAGE}${N}"
+    else echo "    ${R}✗${N} proxy     ${DIM}${PROXY_IMAGE}${N}   ${Y}→ run: airlock build${N}"; fi
+    echo ""
+
+    # ---- running ----
+    echo "  ${B}Running now${N}"
     found=0
     while IFS=$'\t' read -r name st; do
       [ -z "$name" ] && continue
       found=1
       case "$name" in
-        *untrusted*) echo "  🔒 SAFE     $name" ; echo "             UNTRUSTED — no history, network = whitelist only   ($st)" ;;
-        *dev*)       echo "  ⚠️  TRUSTED  $name" ; echo "             DEV — your Claude history + FULL internet           ($st)" ;;
-        *proxy*)     echo "  🛡️  proxy    $name   (egress whitelist)                       ($st)" ;;
-        *)           echo "  •  $name   ($st)" ;;
+        *untrusted*) echo "    🔒 ${G}SAFE${N}     ${name}  ${DIM}· untrusted · whitelist net · ${st}${N}" ;;
+        *dev*)       echo "    ⚠  ${Y}TRUSTED${N}  ${name}  ${DIM}· full internet + history · ${st}${N}" ;;
+        *proxy*)     echo "    🛡  ${C}proxy${N}    ${name}  ${DIM}· egress whitelist · ${st}${N}" ;;
+        *)           echo "    • ${name}  ${DIM}· ${st}${N}" ;;
       esac
     done < <(docker ps --filter "name=airlock" --format '{{.Names}}\t{{.Status}}')
-    [ "$found" = 0 ] && echo "  (nothing running — sandboxes are disposable, this is normal)"
+    [ "$found" = 0 ] && echo "    ${DIM}nothing running — sandboxes are disposable, this is normal${N}"
     echo ""
-    echo "egress whitelist ($FILTER):"
-    grep -vE '^\s*#|^\s*$' "$FILTER" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+
+    # ---- modes ----
+    echo "  ${B}Modes${N}"
+    echo "    ${G}airlock run${N}   🔒 ${G}safe${N}     ${DIM}untrusted code · whitelist network · no history${N}"
+    echo "    ${Y}airlock dev${N}   ⚠  ${Y}trusted${N}  ${DIM}your code · full internet · Claude history${N}"
+    echo ""
+
+    # ---- whitelist (readable) ----
+    wl_count="$(readable_whitelist | wc -l | tr -d ' ')"
+    echo "  ${B}Network whitelist${N}  ${DIM}· ${wl_count} domains reachable in 'run' mode; all others blocked${N}"
+    printf '%s' "$C"
+    readable_whitelist | awk '{printf "    %-26s", $0; if (NR%2==0) printf "\n"} END {if (NR%2) printf "\n"}'
+    printf '%s' "$N"
+    echo "    ${DIM}edit: airlock allow <domain>   ·   list lives in proxy/filter${N}"
+    hr
     ;;
 
   build)   dc --profile run --profile dev build "$@" ;;
