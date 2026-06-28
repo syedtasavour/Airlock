@@ -7,6 +7,12 @@
 #                       trust. (alias: `airlock shell`)
 #   airlock dev [CMD]   TRUSTED mode: your Claude login works, full internet.
 #                       For your own code.
+#   airlock sbx [CMD]   STRONGEST mode: a Docker microVM (own kernel) running the
+#                       project with airlock's same egress whitelist. Escape-proof
+#                       + exfil-proof. Needs `docker sandbox` (Docker Desktop 4.58+).
+#                       KEPT & reused by default so login/installs persist:
+#                         airlock sbx --fresh   delete the old box, start a new one
+#                         airlock sbx down      destroy this project's microVM
 #
 #   airlock exec [CMD]  open ANOTHER terminal into the running sandbox
 #   airlock allow DOM   add a domain to the egress whitelist (then rebuild)
@@ -92,23 +98,37 @@ launch_banner() {
   hr
   if [ "$mode" = run ]; then
     echo "  🔒 ${B}${G}airlock · UNTRUSTED${N}   ${DIM}safe — locked-down sandbox${N}"
+  elif [ "$mode" = sbx ]; then
+    echo "  🧊 ${B}${C}airlock · SBX${N}   ${DIM}strongest — microVM (own kernel) + whitelist${N}"
   else
     echo "  ⚠  ${B}${Y}airlock · DEV${N}   ${DIM}trusted — full access, for your own code${N}"
   fi
   hr
   echo "  ${B}path${N}      ${C}${WORKSPACE}${N}"
-  echo "            ${DIM}↳ mounted at /workspace — the only host folder the box can see${N}"
-  if [ "$mode" = run ]; then
+  if [ "$mode" = sbx ]; then
+    echo "            ${DIM}↳ mounted in the microVM — the only host folder it can see${N}"
+    echo "  ${B}isolation${N} ${C}microVM${N} ${DIM}· own Linux kernel — a container escape can't reach your Mac${N}"
     echo "  ${B}network${N}   ${G}whitelist only${N} ${DIM}· ${wl} domains allowed, everything else blocked${N}"
-    echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· Claude token only, no history${N}"
+    echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· project dir only${N}"
+    echo "  ${B}ports${N}     ${DIM}publish with: docker sandbox network proxy / ports${N}"
   else
-    echo "  ${B}network${N}   ${Y}full internet${N}"
-    echo "  ${B}secrets${N}   ${Y}Claude login + history${N} ${DIM}· trusted mode${N}"
+    echo "            ${DIM}↳ mounted at /workspace — the only host folder the box can see${N}"
+    if [ "$mode" = run ]; then
+      echo "  ${B}network${N}   ${G}whitelist only${N} ${DIM}· ${wl} domains allowed, everything else blocked${N}"
+      echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· Claude token only, no history${N}"
+    else
+      echo "  ${B}network${N}   ${Y}full internet${N}"
+      echo "  ${B}secrets${N}   ${Y}Claude login + history${N} ${DIM}· trusted mode${N}"
+    fi
+    echo "  ${B}ports${N}     ${DIM}3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac${N}"
   fi
-  echo "  ${B}ports${N}     ${DIM}3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac${N}"
   echo "  ${B}claude${N}    ${CLAUDE_STATE}"
   hr
-  echo "  ${DIM}type 'exit' to leave — the container is destroyed (fresh next spin)${N}"
+  if [ "$mode" = sbx ]; then
+    echo "  ${DIM}'exit' leaves — the microVM is KEPT (reused next spin) · new: airlock sbx --fresh · destroy: airlock sbx down${N}"
+  else
+    echo "  ${DIM}type 'exit' to leave — the container is destroyed (fresh next spin)${N}"
+  fi
   echo ""
 }
 
@@ -142,6 +162,48 @@ teardown_proxy_if_idle() {
   dc --profile run down --remove-orphans >/dev/null 2>&1 || true
 }
 
+# ---- sbx (Docker microVM) integration -------------------------------------
+# `airlock sbx` runs the project inside a Docker Sandbox: a microVM with its
+# OWN kernel (hardware-enforced isolation, so a container escape can't reach the
+# host), and we apply airlock's SAME egress whitelist via the sandbox's proxy.
+# Escape-proof + exfil-proof. Requires `docker sandbox` (Docker Desktop 4.58+).
+
+# Image used as the microVM template so airlock's tooling (node/pnpm/deploy CLIs)
+# is present inside. Override with AIRLOCK_SBX_TEMPLATE= to use sbx's default,
+# or AIRLOCK_SBX_TEMPLATE=some/image to use another.
+SBX_TEMPLATE="${AIRLOCK_SBX_TEMPLATE-$SANDBOX_IMAGE}"
+
+dsbx() { docker sandbox "$@"; }
+
+sbx_require() {
+  if ! docker sandbox version >/dev/null 2>&1; then
+    echo "${R}✗ 'docker sandbox' not available.${N}"
+    echo "  airlock sbx needs Docker Sandboxes (Docker Desktop 4.58+ or the sbx CLI)."
+    echo "  Update Docker Desktop, or use ${G}airlock run${N} (container mode) instead."
+    exit 1
+  fi
+}
+
+# Stable per-project sandbox name (sbx allows [A-Za-z0-9._+-]).
+sbx_name() {
+  local base hash
+  base="$(basename "$WORKSPACE" | tr -cs 'A-Za-z0-9._+-' '-' | sed 's/-*$//')"
+  hash="$(printf '%s' "$WORKSPACE" | cksum | cut -d' ' -f1)"
+  printf 'airlock-%s-%s' "${base:-ws}" "$hash"
+}
+
+sbx_exists() { docker sandbox ls 2>/dev/null | grep -qw "$1"; }
+
+# Translate airlock's regex whitelist into `--allow-host` flags for the sbx
+# proxy. *.foo.com -> foo.com (sbx matches the domain + its subdomains).
+sbx_apply_whitelist() {
+  local name="$1" d; local -a allow=()
+  while IFS= read -r d; do
+    [ -n "$d" ] && allow+=(--allow-host "$d")
+  done < <(readable_whitelist | sed -E 's/^\*\.//' | sort -u)
+  dsbx network proxy "$name" --policy deny "${allow[@]}" >/dev/null
+}
+
 print_help() {
   cat <<EOF
   ${B}airlock${N} — disposable hardened sandbox for running untrusted code & deploying
@@ -152,6 +214,8 @@ print_help() {
   ${B}ENTER A SANDBOX${N}
     ${G}run${N} [cmd]        🔒 untrusted code — no history, whitelist-only network
     ${Y}dev${N} [cmd]        ⚠  your own code — Claude login + full internet
+    ${C}sbx${N} [cmd]        🧊 strongest — Docker microVM (own kernel) + whitelist
+                     ${DIM}kept & reused by default · 'airlock sbx --fresh' new · 'airlock sbx down' destroy${N}
     exec [cmd]       open another terminal into the running sandbox
 
   ${B}NETWORK${N}
@@ -159,20 +223,30 @@ print_help() {
     blocked          list the URLs/hosts the proxy denied (not whitelisted)
     logs             watch what the proxy allows / blocks (live)
 
+  ${B}LIFECYCLE${N}  ${DIM}(fresh start / destroy — works for every mode)${N}
+    run / dev        throwaway: each spin is a fresh container (--rm), destroyed on exit
+    sbx              kept & reused so login/installs persist; ${DIM}airlock sbx --fresh${N} = new box
+    sbx down         destroy just this project's microVM
+    down             stop & remove EVERYTHING — run/dev containers, proxy, all sbx microVMs
+
   ${B}MANAGE${N}
     status           what's running, and whether it's safe
-    down             stop & remove the sandbox + proxy
+    down             stop & remove the sandboxes (run/dev/sbx) + proxy
     build            build images
     rebuild          build images from scratch (no cache)
 
   ${B}INFO${N}
     help             this help   (also: --help, -h)
 
-  ${B}EXAMPLES${N}
-    ${DIM}cd ~/some/oss && airlock run${N}        run sketchy code safely
-    ${DIM}cd ~/CodeBase/app && airlock dev${N}    your code, with Claude
-    ${DIM}airlock run npm test${N}                one-off command
-    ${DIM}airlock allow files.example.com${N}     widen the whitelist
+  ${B}EXAMPLES${N}  ${DIM}(by use case)${N}
+    ${DIM}cd ~/some/oss && airlock run${N}        untrusted OSS — safe, light, throwaway
+    ${DIM}cd ~/CodeBase/app && airlock dev${N}    your own code — full internet, your tools
+    ${DIM}cd ~/malware && airlock sbx${N}         hostile code / agents — microVM, escape-proof
+    ${DIM}airlock run npm test${N}                one-off command in a fresh box
+    ${DIM}airlock sbx npm test${N}                one-off command in the kept microVM
+    ${DIM}airlock sbx --fresh${N}                 wipe & rebuild this project's microVM
+    ${DIM}airlock sbx down${N}                    destroy this project's microVM
+    ${DIM}airlock allow files.example.com${N}     widen the whitelist (run/sbx)
 
   ${DIM}The folder you launch from becomes /workspace — the only host folder the
   sandbox sees. Bind dev servers to 0.0.0.0 to reach them at localhost on your Mac.${N}
@@ -220,6 +294,61 @@ case "$cmd" in
     if [ "$#" -eq 0 ]; then docker exec -it "$cid" bash; else docker exec -it "$cid" "$@"; fi
     ;;
 
+  sbx)
+    sbx_require
+    set_workspace
+    name="$(sbx_name)"
+
+    # Subcommands / flags (KEEP by default; --fresh deletes the old one first).
+    case "${1:-}" in
+      down|rm)
+        if sbx_exists "$name"; then
+          echo "› removing microVM sandbox '$name'…"
+          dsbx rm "$name" >/dev/null 2>&1 || true
+          echo "› done"
+        else
+          echo "› no microVM for this project — nothing to remove"
+        fi
+        exit 0
+        ;;
+      --fresh|fresh|new)
+        shift || true
+        if sbx_exists "$name"; then
+          echo "${DIM}› --fresh: deleting old microVM '$name'…${N}"
+          dsbx rm "$name" >/dev/null 2>&1 || true
+        fi
+        ;;
+    esac
+
+    # Reuse the kept microVM if it exists; otherwise create one.
+    if sbx_exists "$name"; then
+      echo "${DIM}› reusing microVM '$name' — login + installs from last time persist${N}"
+    else
+      ensure_built            # the template reuses airlock's tooling image
+      echo "${DIM}› creating microVM sandbox '$name'…${N}"
+      if [ -n "$SBX_TEMPLATE" ]; then
+        dsbx create --name "$name" --template "$SBX_TEMPLATE" shell "$WORKSPACE"
+      else
+        dsbx create --name "$name" shell "$WORKSPACE"
+      fi
+    fi
+    echo "${DIM}› applying egress whitelist (default-deny)…${N}"
+    sbx_apply_whitelist "$name"
+    # Claude isn't auto-seeded (sbx mounts only the project) — but the box is
+    # KEPT, so `/login` once inside and it persists across future spins.
+    CLAUDE_STATE="${DIM}run /login once — it persists (sandbox is kept)${N}"
+    launch_banner sbx
+    # KEEP by default: no teardown on exit. New box: airlock sbx --fresh.
+    # Destroy: airlock sbx down.
+    if [ "$#" -eq 0 ]; then
+      dsbx run "$name"
+    elif [ -t 0 ]; then
+      dsbx exec -it "$name" "$@"
+    else
+      dsbx exec -i "$name" "$@"   # piped/no-TTY: don't request a pseudo-TTY
+    fi
+    ;;
+
   allow)
     [ "$#" -ge 1 ] || { echo "usage: airlock allow <domain>   e.g. airlock allow example.com"; exit 1; }
     dom="$1"
@@ -234,6 +363,11 @@ case "$cmd" in
     docker ps -a --format '{{.ID}} {{.Names}}' \
       | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' \
       | xargs -r docker rm -f >/dev/null 2>&1 || true
+    # remove any airlock sbx microVMs too
+    if docker sandbox version >/dev/null 2>&1; then
+      docker sandbox ls 2>/dev/null | grep -oE 'airlock-[A-Za-z0-9._+-]+' | sort -u \
+        | xargs -r -n1 docker sandbox rm >/dev/null 2>&1 || true
+    fi
     echo "› done"
     ;;
 

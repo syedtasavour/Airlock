@@ -24,7 +24,8 @@ airlock run        # locked-down, throwaway shell — safe to run anything
 - [Why this matters](#why-this-matters)
 - [When to use it (scenarios)](#when-to-use-it-scenarios)
 - [Why use it even for your *own* code](#why-use-it-even-for-your-own-code)
-- [Two modes](#two-modes)
+- [Three modes](#three-modes)
+- [Which mode? — use cases, rated by safety & cost](#which-mode--use-cases-rated-by-safety--cost)
 - [Setup (fresh / reset Mac)](#setup-fresh--reset-mac)
 - [Quick start](#quick-start)
 - [Commands](#commands)
@@ -74,6 +75,9 @@ enough — isolation stops escape, egress control stops exfiltration.
 - **Trying a sketchy CLI / install script.** `curl … | bash`-style installers
   run contained instead of as you.
 - **Reproducing a Linux-only bug** from your Mac without dual-booting.
+- **Genuinely hostile code or an autonomous agent.** `airlock sbx` runs it in a
+  microVM with its *own* kernel, so even a container-escape can't reach your Mac
+  — with the same egress whitelist applied.
 
 ---
 
@@ -97,19 +101,64 @@ workstation:
 
 ---
 
-## Two modes
+## Three modes
 
-| | `airlock run` (UNTRUSTED) | `airlock dev` (TRUSTED) |
-|---|---|---|
-| **Use for** | OSS you don't trust | your own code |
-| **Host secrets** | only the Claude **token** | Claude token **+ history** |
-| **Network** | 🔒 whitelist proxy only | 🌐 full internet |
-| **Filesystem** | only the project dir | only the project dir |
-| **Claude Code** | ✅ logged in (no history) | ✅ logged in (full history) |
+| | `airlock run` (UNTRUSTED) | `airlock dev` (TRUSTED) | `airlock sbx` (MICRO-VM) |
+|---|---|---|---|
+| **Use for** | OSS you don't trust | your own code | hostile code / agents |
+| **Isolation** | container (shared kernel) | container (shared kernel) | **microVM (own kernel)** |
+| **Host secrets** | only the Claude **token** | Claude token **+ history** | none (project only) |
+| **Network** | 🔒 whitelist proxy only | 🌐 full internet | 🔒 whitelist proxy only |
+| **Filesystem** | only the project dir | only the project dir | only the project dir |
+| **Claude Code** | ✅ logged in (no history) | ✅ logged in (full history) | use `docker sandbox run claude` |
+| **Cost** | light | light | heavier (VM RAM + boot) |
 
-Both share the hardening: non-root user, **read-only root filesystem**, all
-Linux capabilities dropped, no privilege escalation, RAM-backed ephemeral home,
-CPU / memory / PID limits, and a throwaway (`--rm`) container.
+`run` and `dev` share the hardening: non-root user, **read-only root filesystem**,
+all Linux capabilities dropped, no privilege escalation, RAM-backed ephemeral
+home, CPU / memory / PID limits, and a throwaway (`--rm`) container.
+
+`sbx` adds a **separate Linux kernel** (Docker Sandbox microVM) so even a
+container-escape 0-day can't reach your Mac — with airlock's same egress
+whitelist applied. It's the strongest, and the heaviest.
+
+## Which mode? — use cases, rated by safety & cost
+
+**Safety** = how well it contains hostile code. **Cost** = system resources +
+startup time. Pick the lightest mode that covers your threat.
+
+| Scenario | Mode | Safety | Cost |
+|---|---|:---:|:---:|
+| `npm install` / clone a random OSS repo | `run` | 🟢🟢🟢🟢 | 🪶 light |
+| Run a `curl … \| bash` installer you don't trust | `run` | 🟢🟢🟢🟢 | 🪶 light |
+| Deploy for a client (fresh `vercel`/`heroku` login) | `run` | 🟢🟢🟢🟢 | 🪶 light |
+| Genuinely **hostile** code / malware analysis | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
+| An **autonomous AI agent** with shell access | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
+| Untrusted code that needs an **escape-proof** boundary | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
+| Your **own** project — build/test on Linux | `dev` | 🟡🟡 | 🪶 light |
+| Your own code + Claude with full history | `dev` | 🟡🟡 | 🪶 light |
+| Reproduce a Linux-only bug from your Mac | `dev` | 🟡🟡 | 🪶 light |
+
+**Rule of thumb:**
+- **Default to `run`** for anything you don't trust — it already blocks secret
+  theft (only the project is mounted) and exfiltration (whitelist). Light enough
+  for all-day use, even on a 16 GB Air.
+- **Escalate to `sbx`** only when a kernel-escape would be catastrophic (real
+  malware, fully autonomous agents) and you can spare the RAM (a microVM can
+  claim ~50% of host RAM while live).
+- **Use `dev`** only for code you **wrote/trust** — it has full internet and your
+  Claude history, so it's not for untrusted code.
+
+> Why isn't `dev` "safe"? It's not meant to be — it trades isolation for
+> convenience on *your own* code (full internet + history). The 🟡 rating is a
+> reminder: never point `dev` at code you don't trust; use `run` or `sbx`.
+
+### Safety ladder (most → least contained)
+
+```
+sbx   🟢🟢🟢🟢🟢   microVM (own kernel) + whitelist + no secrets   — hostile code, agents
+run   🟢🟢🟢🟢     container + whitelist + token-only             — untrusted OSS, deploys
+dev   🟡🟡         container + full internet + your history       — your own trusted code
+```
 
 ---
 
@@ -174,6 +223,7 @@ container can see.
 ```
 airlock run [CMD]   UNTRUSTED mode — no history, whitelist-only network
 airlock dev [CMD]   TRUSTED mode — Claude login + full internet
+airlock sbx [CMD]   STRONGEST — Docker microVM (own kernel) + same whitelist
 airlock exec [CMD]  open ANOTHER terminal into the running sandbox
 airlock allow DOM   add a domain to the egress whitelist (then rebuild)
 airlock blocked     list the URLs/hosts the proxy denied (not whitelisted)
@@ -262,6 +312,50 @@ the host). `airlock logs` shows what's being blocked.
 
 > `dev` mode uses full internet (it's your trusted code). Only `run` is gated.
 
+### `airlock sbx` — microVM mode (strongest)
+
+`run` and `dev` are containers (shared host kernel). `airlock sbx` runs the
+project inside a **Docker Sandbox microVM** — its *own* Linux kernel — so even a
+container-escape 0-day can't reach your Mac. airlock applies its **same
+default-deny egress whitelist** to the microVM's proxy, so it's **escape-proof
+and exfil-proof** at once.
+
+```bash
+cd ~/some/cloned/oss-project
+airlock sbx                 # boot (or reuse) a microVM, apply whitelist, drop in
+airlock sbx npm test        # one-off command inside the microVM
+airlock sbx --fresh         # delete the old box and start a clean one
+airlock sbx down            # destroy this project's microVM
+```
+
+- Needs `docker sandbox` (Docker Desktop 4.58+). If it's missing, airlock tells
+  you and you can fall back to `airlock run`.
+- The microVM reuses airlock's tooling image as its template (Node, pnpm, deploy
+  CLIs). Override with `AIRLOCK_SBX_TEMPLATE=<image>`, or set it empty to use
+  Docker's default shell template.
+- The same whitelist from `proxy/filter` is translated to the sandbox proxy
+  (verified: non-whitelisted hosts get **403**, whitelisted hosts **200**). See
+  what was blocked with `docker sandbox network log`.
+- **Kept & reused by default** (per-project, one microVM). This matches Docker's
+  model — sandboxes persist across restarts — so your `/login`, `nvm install`s,
+  and other home-dir setup survive the next spin and startup is fast. Node and
+  the deploy CLIs are baked into the image, so they're never reinstalled either
+  way. `airlock sbx --fresh` deletes the old box and creates a clean one;
+  `airlock sbx down` (or `airlock down`) destroys it.
+- Claude isn't auto-seeded (the microVM mounts only your project), but because
+  the box is **kept**, you just run `/login` once inside and it persists. Or use
+  Docker's native agent: `docker sandbox run claude`.
+
+> Reuse keeps the **isolation** (own kernel, no host secrets, whitelist) — that's
+> what makes it a sandbox. It only drops the **fresh-start**, which matters for
+> *untrusted* code. So: reuse for your repeated trusted work; use `--fresh` (or
+> the throwaway `airlock run`) for genuinely hostile code where no carry-over is
+> the point.
+
+> Trade-off: a microVM uses more RAM and has a boot step, so it's heavier than
+> `run`. Use `sbx` for genuinely hostile code or autonomous agents; `run` is
+> fine for everyday untrusted installs.
+
 When you exit an `airlock run` sandbox, the proxy and its network are **torn
 down automatically** — nothing internet-connected lingers. (If a second
 `airlock exec`/`run` terminal is still open, the proxy stays up until the last
@@ -320,8 +414,9 @@ CPU/mem/PID caps).
 
 **What it does NOT protect against — be honest:**
 
-- **Shared kernel.** This is containers, not a VM. A kernel-level container
-  escape (0-day) would defeat it. For maximum isolation, run on a throwaway VM.
+- **Shared kernel (`run`/`dev`).** These are containers, not VMs. A kernel-level
+  container escape (0-day) would defeat them. For maximum isolation use
+  **`airlock sbx`**, which runs in a microVM with its own kernel.
 - **The project dir is read-write.** Untrusted code can modify files in the
   folder you opened (that's your project). It can't touch anything else.
 - **Whitelisted domains are trusted.** If you `allow` a domain, code can talk to
