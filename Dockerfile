@@ -2,7 +2,8 @@
 # deploying with throwaway CLI logins. Ships Vercel / Netlify / Heroku /
 # Firebase / Wrangler + Claude Code.
 # Runs as a NON-ROOT user; the root filesystem is mounted read-only by compose.
-FROM node:20-bookworm
+# Default Node is pinned to 24.16; nvm is available inside to switch versions.
+FROM node:24.16-bookworm
 
 # --- base tooling -----------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,6 +30,27 @@ RUN npm install -g \
         wrangler \
         @anthropic-ai/claude-code \
     && npm cache clean --force
+
+# --- pnpm as the default package manager ------------------------------------
+# Installed globally at build time so it works fully offline and under the
+# read-only root fs (corepack's lazy "fetch latest at runtime" breaks in the
+# network-restricted untrusted mode, so we bake a real pnpm binary instead).
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN npm install -g pnpm && npm cache clean --force
+
+# --- nvm (Node Version Manager), available inside the sandbox ---------------
+# nvm.sh is baked read-only at /usr/local/nvm. At runtime NVM_DIR points at the
+# writable (tmpfs) home, so `nvm install <ver>` works per-session. Default node
+# stays 24.16 (from the base image); nvm is for switching when a project needs it.
+RUN mkdir -p /usr/local/nvm \
+    && curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh \
+       | NVM_DIR=/usr/local/nvm PROFILE=/dev/null bash
+# Load nvm in every interactive bash shell, with installs going to the home dir.
+RUN printf '%s\n' \
+    'export NVM_DIR="$HOME/.nvm"' \
+    'mkdir -p "$NVM_DIR"' \
+    '[ -s /usr/local/nvm/nvm.sh ] && \. /usr/local/nvm/nvm.sh' \
+    >> /etc/bash.bashrc
 
 # Seed login/session from the read-only host mount into the writable home.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

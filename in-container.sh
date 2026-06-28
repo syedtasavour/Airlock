@@ -7,7 +7,8 @@ cat <<'EOF'
 
   No need for `airlock` in here. Just use the tools directly:
 
-    node / npm / pnpm / yarn        run & build the project
+    node (24.16) · pnpm · npm        run & build the project
+    nvm install <ver>                switch Node version (per-session)
     vercel · netlify · heroku       deploy CLIs (log in fresh each spin)
     firebase · wrangler             more deploy CLIs
     claude                          Claude Code (dev mode only)

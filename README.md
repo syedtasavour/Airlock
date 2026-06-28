@@ -158,6 +158,15 @@ airlock dev
 The folder you launch from becomes `/workspace` — the **only** host folder the
 container can see.
 
+### Toolchain
+
+- **Node 24.16** (default), **pnpm** and **npm** preinstalled and working offline.
+- **nvm** is available to switch Node versions: `nvm install 20 && nvm use 20`.
+  Because the sandbox home is ephemeral, nvm-installed versions last for the
+  current session (re-install next spin). The default 24.16 is always present.
+- Deploy CLIs: **vercel · netlify · heroku · firebase · wrangler**. Plus
+  **git**, **ripgrep**, and **claude** (Claude Code).
+
 ---
 
 ## Commands
