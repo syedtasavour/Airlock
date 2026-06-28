@@ -10,6 +10,15 @@
 # container and is discarded on exit — never written back to the host.
 set -e
 
+# Link the baked native Claude binary into the (ephemeral, tmpfs) home so its
+# launcher path $HOME/.local/bin/claude exists every spin. The real ~225MB
+# self-contained binary lives read-only in /opt (see Dockerfile); the home is
+# wiped on stop, so this symlink must be recreated on each launch.
+if [ -x /opt/claude/claude ]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sf /opt/claude/claude "$HOME/.local/bin/claude"
+fi
+
 if [ "${AIRLOCK_SEED_CLAUDE:-0}" = "1" ]; then
   mkdir -p "$HOME/.claude"
 
