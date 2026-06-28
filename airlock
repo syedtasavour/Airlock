@@ -118,6 +118,16 @@ running_sandbox() {
     | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' | head -1
 }
 
+# Tear down the proxy + networks, but ONLY if no other sandbox is still running
+# (so a 2nd `airlock exec`/`run` terminal doesn't lose its network).
+teardown_proxy_if_idle() {
+  if docker ps --format '{{.Names}}' | grep -qE 'airlock-(untrusted|dev)-run'; then
+    return 0   # another sandbox is live — leave the proxy up for it
+  fi
+  echo "${DIM}› tearing down proxy + isolated network…${N}"
+  dc --profile run down --remove-orphans >/dev/null 2>&1 || true
+}
+
 print_help() {
   cat <<EOF
   ${B}airlock${N} — disposable hardened sandbox for running untrusted code & deploying
@@ -162,6 +172,10 @@ case "$cmd" in
     set_workspace
     sync_claude_creds
     launch_banner run
+    # When this sandbox shell exits (or Ctrl-C), stop the proxy too — unless
+    # another sandbox terminal is still running. Keeps no internet-connected
+    # container lingering once you're done.
+    trap teardown_proxy_if_idle EXIT
     if [ "$#" -eq 0 ]; then
       dc --profile run run --rm --service-ports untrusted bash
     else

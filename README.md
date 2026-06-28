@@ -254,6 +254,11 @@ the host). `airlock logs` shows what's being blocked.
 
 > `dev` mode uses full internet (it's your trusted code). Only `run` is gated.
 
+When you exit an `airlock run` sandbox, the proxy and its network are **torn
+down automatically** — nothing internet-connected lingers. (If a second
+`airlock exec`/`run` terminal is still open, the proxy stays up until the last
+one exits.)
+
 ---
 
 ## Multiple terminals
