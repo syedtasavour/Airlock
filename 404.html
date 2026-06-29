@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex" />
+<title>404 — blocked by airlock</title>
+<link rel="icon" href="/Airlock/assets/img/favicon.svg" type="image/svg+xml" />
+<style>
+  :root{--bg:#05070d;--ink:#eef3ff;--dim:#9fb0cc;--safe:#2dd673;--danger:#ff5470;--sbx:#34d6ff;
+    --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;--font:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+  *{margin:0;box-sizing:border-box}
+  body{min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);
+    font-family:var(--font);text-align:center;padding:24px;overflow:hidden}
+  body::before{content:"";position:fixed;inset:-30%;z-index:-1;filter:blur(90px);opacity:.5;
+    background:radial-gradient(40% 35% at 30% 30%,rgba(255,84,112,.25),transparent 60%),
+      radial-gradient(40% 35% at 70% 70%,rgba(52,214,255,.2),transparent 60%)}
+  .code{font-family:var(--mono);font-size:clamp(4rem,18vw,9rem);font-weight:800;line-height:1;
+    background:linear-gradient(110deg,var(--danger),var(--sbx));-webkit-background-clip:text;background-clip:text;color:transparent}
+  h1{font-size:clamp(1.3rem,4vw,2rem);margin:18px 0 10px;letter-spacing:-.02em}
+  p{color:var(--dim);max-width:46ch;margin:0 auto 28px;line-height:1.6}
+  .term{font-family:var(--mono);font-size:.85rem;color:var(--dim);border:1px solid rgba(120,150,200,.2);
+    border-radius:12px;padding:14px 18px;display:inline-block;margin-bottom:28px;background:rgba(13,19,34,.5)}
+  .term .bad{color:var(--danger)}.term .ok{color:var(--safe)}
+  a.btn{display:inline-flex;gap:8px;align-items:center;font-weight:600;text-decoration:none;
+    padding:13px 24px;border-radius:12px;background:linear-gradient(135deg,var(--safe),#19b65c);color:#04210f}
+</style>
+</head>
+<body>
+  <main>
+    <div class="code">403→404</div>
+    <h1>🔒 This request didn't make the whitelist.</h1>
+    <p>That page isn't on the manifest. Like an unknown host hitting airlock's egress proxy — denied by default.</p>
+    <div class="term"><span class="bad">✗ blocked</span> &nbsp;the page you wanted &nbsp;<span style="opacity:.5">→ default-deny</span><br><span class="ok">✓ allowed</span> &nbsp;the home page &nbsp;<span style="opacity:.5">→ on the whitelist</span></div>
+    <br>
+    <a class="btn" href="/Airlock/">← Back to safety (home)</a>
+  </main>
+</body>
+</html>

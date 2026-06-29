@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en" itemscope itemtype="https://schema.org/SoftwareApplication">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#05070d" />
+<meta name="color-scheme" content="dark" />
+
+<!-- ===================== PRIMARY SEO ===================== -->
+<title>airlock — Disposable Hardened Linux Sandbox for Running Untrusted Code Safely</title>
+<meta name="description" content="airlock is a disposable, hardened Linux sandbox for macOS. Run untrusted npm packages, sketchy OSS, and curl|bash installers without exposing your keys, files, or secrets — filesystem isolation + an egress whitelist + throwaway containers. Three modes: run, dev, and a microVM sbx with its own kernel. Built on the same model Anthropic uses to contain Claude Code." />
+<meta name="keywords" content="airlock, sandbox, untrusted code, npm supply chain attack, malicious npm package, postinstall script, docker sandbox, microVM, egress whitelist, container isolation, exfiltration prevention, event-stream, ua-parser-js, node-ipc, Shai-Hulud worm, secure development, macOS sandbox, Claude Code sandboxing" />
+<meta name="author" content="Syed Tasavour" />
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+<link rel="canonical" href="https://syedtasavour.github.io/Airlock/" />
+
+<!-- ===================== OPEN GRAPH ===================== -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="airlock" />
+<meta property="og:title" content="airlock — Run Untrusted Code Without Exposing Your Mac" />
+<meta property="og:description" content="A disposable, hardened Linux sandbox. Code goes in, does its work, the container is destroyed on exit. Filesystem isolation + egress whitelist. Nothing leaks out." />
+<meta property="og:url" content="https://syedtasavour.github.io/Airlock/" />
+<meta property="og:locale" content="en_US" />
+<meta property="og:image" content="https://syedtasavour.github.io/Airlock/assets/img/favicon.svg" />
+<meta property="og:image:alt" content="airlock — disposable hardened Linux sandbox" />
+
+<!-- ===================== TWITTER ===================== -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="airlock — Disposable Hardened Sandbox for Untrusted Code" />
+<meta name="twitter:description" content="Clone it. airlock run. Poke at it. If it's malware, it can't reach your keys or phone home. Then it's gone." />
+<meta name="twitter:image" content="https://syedtasavour.github.io/Airlock/assets/img/favicon.svg" />
+
+<!-- ===================== ICONS / MANIFEST ===================== -->
+<link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
+<link rel="mask-icon" href="assets/img/favicon.svg" color="#2dd673" />
+<link rel="manifest" href="site.webmanifest" />
+
+<!-- ===================== STRUCTURED DATA ===================== -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "airlock",
+  "applicationCategory": "DeveloperApplication",
+  "applicationSubCategory": "Security / Sandboxing",
+  "operatingSystem": "macOS",
+  "description": "A disposable, hardened Linux sandbox for running untrusted code and deploying with throwaway CLI logins — without ever exposing your Mac's keys, files, or secrets.",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Syed Tasavour" },
+  "url": "https://syedtasavour.github.io/Airlock/",
+  "codeRepository": "https://github.com/syedtasavour/airlock",
+  "softwareRequirements": "Docker Desktop 4.58+ (microVM mode), macOS",
+  "featureList": [
+    "Filesystem isolation — only the project folder is mounted",
+    "Egress whitelist proxy — default-deny network",
+    "Throwaway --rm containers — destroyed on exit",
+    "Read-only root filesystem, all Linux capabilities dropped",
+    "microVM mode with its own kernel (escape-proof)",
+    "Preinstalled deploy CLIs and Claude Code"
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "What does airlock protect against?",
+      "acceptedAnswer": { "@type": "Answer", "text": "A malicious dependency or script reading your home directory and keys (filesystem isolation), exfiltrating data (egress whitelist), and persistence or resource exhaustion (read-only root, throwaway container, CPU/memory/PID caps)." } },
+    { "@type": "Question", "name": "What is the difference between run, dev, and sbx mode?",
+      "acceptedAnswer": { "@type": "Answer", "text": "run is UNTRUSTED mode: container isolation, whitelist-only network, no host secrets except the Claude token. dev is TRUSTED mode for your own code: full internet and Claude history. sbx is the strongest: a Docker microVM with its own kernel, escape-proof, with the same egress whitelist." } },
+    { "@type": "Question", "name": "Are npm supply chain attacks a real threat?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. Documented incidents include event-stream (2018, bitcoin-wallet backdoor), ua-parser-js (2021, password stealer and crypto miner, subject of a CISA alert), node-ipc (2022, protestware that wiped files by geo-IP), and the self-propagating Shai-Hulud worm (2025). Install-time lifecycle scripts are the single largest code-execution surface in the npm ecosystem." } }
+  ]
+}
+</script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="assets/css/base.css" />
+<link rel="stylesheet" href="assets/css/layout.css" />
+<link rel="stylesheet" href="assets/css/components.css" />
+</head>
+<body>
+<a class="skip" href="#why">Skip to content</a>
+
+<canvas class="bg-canvas" id="bgCanvas" aria-hidden="true"></canvas>
+<div class="bg-aurora" aria-hidden="true"></div>
+<div class="bg-grid" aria-hidden="true"></div>
+
+<!-- ===================== NAV ===================== -->
+<header class="nav" id="nav">
+  <div class="nav-inner">
+    <a href="#top" class="brand"><span class="shield">🛡️</span> airlock</a>
+    <nav class="nav-links" id="navLinks" aria-label="Primary">
+      <a href="#why">Why</a>
+      <a href="#attacks">In the wild</a>
+      <a href="#modes">Modes</a>
+      <a href="#commands">Commands</a>
+      <a href="#network">Network</a>
+      <a href="#setup">Setup</a>
+      <a href="#references">References</a>
+    </nav>
+    <div class="nav-actions">
+      <a href="https://github.com/syedtasavour/airlock" target="_blank" rel="noopener noreferrer" class="nav-gh" aria-label="airlock on GitHub">
+        <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>GitHub</span>
+      </a>
+      <a href="#setup" class="nav-cta">$ airlock run</a>
+    </div>
+    <button class="burger" id="burger" aria-label="Toggle menu"><span></span><span></span><span></span></button>
+  </div>
+</header>
+
+<!-- ===================== HERO ===================== -->
+<section class="hero" id="top">
+  <div class="wrap two-col">
+    <div class="hero-copy">
+      <span class="hero-badge">🔒 <b>filesystem isolation</b> + <b>egress control</b> · the model Anthropic uses to contain Claude Code</span>
+      <h1>
+        <span class="line"><span>Run code you</span></span>
+        <span class="line"><span><em class="grad-text" style="font-style:normal">don't trust.</em></span></span>
+        <span class="line"><span>Leak nothing.</span></span>
+      </h1>
+      <p class="hero-lead"><strong>airlock</strong> is a disposable, hardened Linux sandbox for your Mac. Code goes in, does its work, and the container is <strong>destroyed on exit</strong> — without ever exposing your keys, files, or secrets.</p>
+      <p class="hero-tag">// an airlock between sketchy code and your real machine</p>
+      <div class="hero-cta">
+        <a href="#setup" class="btn btn-primary">Get started → 3 steps</a>
+        <a href="#attacks" class="btn btn-ghost">Why it matters →</a>
+      </div>
+      <div class="hero-stats">
+        <div class="stat"><b class="grad-text">3</b><span>isolation modes</span></div>
+        <div class="stat"><b class="k-safe">27+</b><span>whitelisted domains</span></div>
+        <div class="stat"><b class="k-sbx">0</b><span>secrets leaked</span></div>
+        <div class="stat"><b class="k-trust">--rm</b><span>throwaway by default</span></div>
+      </div>
+    </div>
+    <div class="chamber" aria-hidden="true">
+      <div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>
+      <div class="orbit o1"><div class="node allowed"><span>✓ npmjs.org</span></div></div>
+      <div class="orbit o2"><div class="node blocked"><span>✗ evil-cdn.net</span></div></div>
+      <div class="orbit o1" style="animation-duration:16s"><div class="node blocked"><span>✗ ~/.ssh</span></div></div>
+      <div class="core">🛡️</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== WHY / PROBLEM ===================== -->
+<section id="why">
+  <div class="wrap">
+    <span class="eyebrow reveal">The problem</span>
+    <h2 class="sec-title reveal d1">Every <span class="grad-text">npm install</span> runs code as <em style="font-style:normal;color:var(--danger)">you</em>.</h2>
+    <p class="sec-sub reveal d2">Modern development means constantly running code you didn't write — cloning OSS, installing hundreds of transitive dependencies, trying a tool from a random GitHub link. Any one can hide a malicious <strong class="ink">postinstall script</strong> or a <strong class="ink">compromised package</strong>. Install-time lifecycle scripts are <strong class="ink">the single largest code-execution surface in the npm ecosystem</strong> — a single compromised package anywhere in your dependency tree runs arbitrary commands on your machine, with access to <code class="k-danger">~/.ssh</code>, cloud credentials, browser tokens and <code class="k-danger">.env</code> files.</p>
+
+    <table class="attack-table reveal d3">
+      <thead><tr><th>Attack step</th><th>Without airlock</th><th>With airlock</th></tr></thead>
+      <tbody>
+        <tr><td>Read your secrets</td><td class="x">Full home-directory access</td><td class="v">Only the project folder is mounted</td></tr>
+        <tr><td>Send them out</td><td class="x">Any internet host</td><td class="v">Egress blocked except a domain whitelist</td></tr>
+        <tr><td>Persist / spread</td><td class="x">Writes anywhere on disk</td><td class="v">Read-only root, throwaway container</td></tr>
+      </tbody>
+    </table>
+    <p class="sec-sub reveal d4" style="margin-top:28px">airlock removes <strong class="ink">both halves</strong> of the attack — isolation stops the escape, egress control stops the exfiltration. Either one alone is not enough.</p>
+  </div>
+</section>
+
+<!-- ===================== DOCUMENTED ATTACKS ===================== -->
+<section id="attacks">
+  <div class="wrap">
+    <span class="eyebrow reveal">In the wild · documented incidents</span>
+    <h2 class="sec-title reveal d1">This isn't hypothetical. <span class="grad-text">It keeps happening.</span></h2>
+    <p class="sec-sub reveal d2">Real, widely-reported supply-chain attacks against the npm ecosystem — each one ran arbitrary code on developer machines during a routine install. Every source below is a primary advisory or major security-press report. <strong class="ink">Verify them yourself.</strong></p>
+
+    <div class="attack-grid">
+      <!-- event-stream -->
+      <article class="atk reveal d1">
+        <div class="atk-top"><span class="atk-year">2018</span><span class="atk-impact">~8M downloads affected</span></div>
+        <h4><code>event-stream</code> → bitcoin-wallet backdoor</h4>
+        <p>A trusted maintainer handed off the package to a new "contributor," who slipped in an obfuscated dependency (<code>flatmap-stream</code>) that harvested private keys from a specific bitcoin wallet app. It sat undetected for ~2.5 months.</p>
+        <div class="atk-srcs">
+          <a class="src-pill" href="https://blog.npmjs.org/post/180565383195/details-about-the-event-stream-incident" target="_blank" rel="noopener noreferrer">npm blog</a>
+          <a class="src-pill" href="https://snyk.io/blog/a-post-mortem-of-the-malicious-event-stream-backdoor/" target="_blank" rel="noopener noreferrer">Snyk</a>
+          <a class="src-pill" href="https://www.theregister.com/2018/11/26/npm_repo_bitcoin_stealer/" target="_blank" rel="noopener noreferrer">The Register</a>
+        </div>
+      </article>
+
+      <!-- ua-parser-js -->
+      <article class="atk reveal d2">
+        <div class="atk-top"><span class="atk-year">2021</span><span class="atk-impact">~7M downloads / week</span></div>
+        <h4><code>ua-parser-js</code> → password stealer + crypto miner</h4>
+        <p>Attackers hijacked the maintainer's npm credentials and published malware that installed a password stealer and a cryptominer on install. The threat was serious enough that <strong class="ink">CISA</strong> issued a public alert.</p>
+        <div class="atk-srcs">
+          <a class="src-pill" href="https://www.cisa.gov/news-events/alerts/2021/10/22/malware-discovered-popular-npm-package-ua-parser-js" target="_blank" rel="noopener noreferrer">CISA alert</a>
+          <a class="src-pill" href="https://www.rapid7.com/blog/post/2021/10/25/npm-library-ua-parser-js-hijacked-what-you-need-to-know/" target="_blank" rel="noopener noreferrer">Rapid7</a>
+        </div>
+      </article>
+
+      <!-- node-ipc -->
+      <article class="atk reveal d3">
+        <div class="atk-top"><span class="atk-year">2022</span><span class="atk-impact">CVE-2022-23812</span></div>
+        <h4><code>node-ipc</code> → "protestware" that wiped files</h4>
+        <p>The maintainer shipped code that, on machines geolocated to Russia or Belarus, overwrote files on disk with a heart emoji. <code>node-ipc</code> is a transitive dependency of the Vue CLI — so the blast radius was enormous.</p>
+        <div class="atk-srcs">
+          <a class="src-pill" href="https://www.bleepingcomputer.com/news/security/big-sabotage-famous-npm-package-deletes-files-to-protest-ukraine-war/" target="_blank" rel="noopener noreferrer">BleepingComputer</a>
+          <a class="src-pill" href="https://snyk.io/blog/peacenotwar-malicious-npm-node-ipc-package-vulnerability/" target="_blank" rel="noopener noreferrer">Snyk</a>
+          <a class="src-pill" href="https://www.theregister.com/2022/03/18/protestware_javascript_node_ipc/" target="_blank" rel="noopener noreferrer">The Register</a>
+        </div>
+      </article>
+
+      <!-- Shai-Hulud -->
+      <article class="atk reveal d4">
+        <div class="atk-top"><span class="atk-year">2025</span><span class="atk-impact">~500 packages · 2.6B weekly downloads</span></div>
+        <h4><code>Shai-Hulud</code> → the first self-propagating npm worm</h4>
+        <p>Phished maintainer tokens let malware steal cloud + npm secrets, publish them publicly, and <strong class="ink">republish itself into more packages automatically</strong>. CISA issued an ecosystem-wide alert. Install scripts fetched second-stage payloads from attacker infrastructure.</p>
+        <div class="atk-srcs">
+          <a class="src-pill" href="https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem" target="_blank" rel="noopener noreferrer">CISA alert</a>
+          <a class="src-pill" href="https://unit42.paloaltonetworks.com/npm-supply-chain-attack/" target="_blank" rel="noopener noreferrer">Palo Alto Unit 42</a>
+        </div>
+      </article>
+    </div>
+
+    <p class="verified reveal d2">✓ Every link above points to a primary advisory (CISA, npm) or established security press — open the <a href="#references" style="color:var(--safe);text-decoration:underline">full reference list ↓</a></p>
+  </div>
+</section>
+
+<!-- ===================== MODES ===================== -->
+<section id="modes">
+  <div class="wrap">
+    <span class="eyebrow reveal">Three modes, one image</span>
+    <h2 class="sec-title reveal d1">Pick the <span class="grad-text">lightest mode</span> that covers your threat.</h2>
+    <p class="sec-sub reveal d2">From everyday untrusted installs to genuinely hostile code and autonomous agents — airlock scales the isolation to the risk.</p>
+    <div class="modes">
+      <article class="mode run reveal d1">
+        <div class="ribbon">DEFAULT</div><span class="m-ico">🔒</span>
+        <h3>run</h3><p class="m-cmd">airlock run [cmd]</p>
+        <p class="m-for"><b class="ink">UNTRUSTED.</b> OSS you don't trust, sketchy installers, client deploys.</p>
+        <ul>
+          <li><span class="k">box</span><span>Container — <b>shared kernel</b>, fully hardened</span></li>
+          <li><span class="k">net</span><span><b>Whitelist proxy</b> only — everything else blocked</span></li>
+          <li><span class="k">fs</span><span>Only the project dir is visible</span></li>
+          <li><span class="k">key</span><span>Claude <b>token</b> only — no history</span></li>
+          <li><span class="k">life</span><span>Throwaway <b>(--rm)</b> — fresh every spin</span></li>
+        </ul>
+      </article>
+      <article class="mode dev reveal d2">
+        <span class="m-ico">⚠️</span>
+        <h3>dev</h3><p class="m-cmd">airlock dev [cmd]</p>
+        <p class="m-for"><b class="ink">TRUSTED.</b> Your own code — a clean, consistent, disposable Linux workstation.</p>
+        <ul>
+          <li><span class="k">box</span><span>Container — same hardening</span></li>
+          <li><span class="k">net</span><span><b>Full internet</b> — it's your trusted code</span></li>
+          <li><span class="k">fs</span><span>Only the project dir is visible</span></li>
+          <li><span class="k">key</span><span>Claude token <b>+ full history</b></span></li>
+          <li><span class="k">life</span><span>Throwaway — Linux parity with prod</span></li>
+        </ul>
+      </article>
+      <article class="mode sbx reveal d3">
+        <div class="ribbon">STRONGEST</div><span class="m-ico">🧊</span>
+        <h3>sbx</h3><p class="m-cmd">airlock sbx [cmd]</p>
+        <p class="m-for"><b class="ink">MICRO-VM.</b> Genuinely hostile code or an autonomous AI agent with shell access.</p>
+        <ul>
+          <li><span class="k">box</span><span><b>microVM — its own kernel.</b> Escape-proof</span></li>
+          <li><span class="k">net</span><span>Same default-deny <b>egress whitelist</b></span></li>
+          <li><span class="k">fs</span><span>Project dir only · <b>no host secrets</b></span></li>
+          <li><span class="k">key</span><span><b>Kept &amp; reused</b> — /login persists</span></li>
+          <li><span class="k">life</span><span><code class="k-sbx">--fresh</code> wipes · <code class="k-sbx">down</code> destroys</span></li>
+        </ul>
+      </article>
+    </div>
+    <p class="sec-sub reveal d4" style="margin-top:38px"><strong class="ink">Rule of thumb:</strong> default to <b class="k-safe">run</b> for anything you don't trust — light enough for all-day use, even on a 16&nbsp;GB Air. Escalate to <b class="k-sbx">sbx</b> only when a kernel-escape would be catastrophic. Use <b class="k-trust">dev</b> only for code you wrote.</p>
+  </div>
+</section>
+
+<!-- ===================== HARDENING ===================== -->
+<section id="hardening" style="padding-top:0">
+  <div class="wrap">
+    <span class="eyebrow reveal">Defense in depth</span>
+    <h2 class="sec-title reveal d1">Hardened to the <span class="grad-text">bone</span>.</h2>
+    <p class="sec-sub reveal d2"><code class="k-safe">run</code> and <code class="k-trust">dev</code> share every one of these guards — defined in <a href="https://github.com/syedtasavour/airlock/blob/main/docker-compose.yml" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">docker-compose.yml</a>. <code class="k-sbx">sbx</code> adds a separate kernel on top.</p>
+    <div class="feat-grid">
+      <div class="feat reveal d1"><div class="f-ico">👤</div><h4>Non-root user</h4><p>Runs as the unprivileged <code>node</code> user (uid 1000) — never root.</p></div>
+      <div class="feat reveal d2"><div class="f-ico">🪨</div><h4>Read-only root FS</h4><p>The entire root filesystem is immutable. Only tiny RAM-backed tmpfs mounts are writable.</p></div>
+      <div class="feat reveal d3"><div class="f-ico">🧹</div><h4>All capabilities dropped</h4><p><code>cap_drop: ALL</code> + <code>no-new-privileges</code> — no privilege escalation.</p></div>
+      <div class="feat reveal d1"><div class="f-ico">💨</div><h4>Ephemeral RAM home</h4><p><code>/home/node</code> is a tmpfs, wiped on stop. Nothing persists between spins.</p></div>
+      <div class="feat reveal d2"><div class="f-ico">📉</div><h4>CPU / memory / PID caps</h4><p>4&nbsp;CPU · 4&nbsp;GB RAM · 512&nbsp;PIDs — fork bombs and runaway builds are blunted.</p></div>
+      <div class="feat reveal d3"><div class="f-ico">🗑️</div><h4>Throwaway container</h4><p><code>--rm</code> means the box is gone the instant you type <code>exit</code>.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== THE MODEL ===================== -->
+<section id="model">
+  <div class="wrap two-col">
+    <div>
+      <span class="eyebrow reveal">The same model the pros use</span>
+      <h2 class="sec-title reveal d1">Two boundaries. <span class="grad-text">Both required.</span></h2>
+      <p class="sec-sub reveal d2">airlock's design mirrors how <strong class="ink">Anthropic</strong> contains Claude Code: <strong class="ink">filesystem isolation</strong> so a compromised process can't read your secrets, plus <strong class="ink">network isolation through a domain-filtering proxy</strong> so it can't exfiltrate them. Their own engineering team is explicit that you need <em>both</em> — without network isolation a compromised agent leaks your SSH keys; without filesystem isolation it escapes and gets network access anyway.</p>
+      <p class="sec-sub reveal d3" style="margin-top:16px">Same two primitives, packaged for your laptop: only the project dir is mounted, and egress runs through a default-deny whitelist (<a href="https://github.com/syedtasavour/airlock/blob/main/proxy/tinyproxy.conf" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">tinyproxy.conf</a>).</p>
+      <div class="hero-cta reveal d4" style="margin-top:26px">
+        <a href="https://www.anthropic.com/engineering/claude-code-sandboxing" target="_blank" rel="noopener noreferrer" class="btn btn-ghost">Anthropic: Claude Code sandboxing ↗</a>
+      </div>
+    </div>
+    <div class="reveal d2">
+      <div class="terminal">
+        <div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span class="title">the containment model</span></div>
+        <div class="body">
+<span class="cmt"># boundary 1 — filesystem isolation</span><br>
+read ~/.ssh/id_rsa     <span class="dim">→</span> <span class="bad">denied (not mounted)</span><br>
+read /workspace/*      <span class="dim">→</span> <span class="ok">ok (your project)</span><br>
+<br>
+<span class="cmt"># boundary 2 — network egress control</span><br>
+POST attacker.net      <span class="dim">→</span> <span class="bad">403 blocked by proxy</span><br>
+GET  registry.npmjs.org<span class="dim">→</span> <span class="ok">200 allowed</span><br>
+<br>
+<span class="cmt"># neither alone is enough:</span><br>
+<span class="dim">  no net  →</span> <span class="warn">escape still leaks via disk</span><br>
+<span class="dim">  no fs   →</span> <span class="warn">escape regains the network</span><br>
+<span class="ok">  both    → contained ✓</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== SCENARIOS ===================== -->
+<section id="scenarios">
+  <div class="wrap">
+    <span class="eyebrow reveal">When to reach for it</span>
+    <h2 class="sec-title reveal d1">Real scenarios, <span class="grad-text">rated by mode</span>.</h2>
+    <p class="sec-sub reveal d2">Each spin is logged out, so you can also deploy for many clients without cross-account mix-ups or credentials left on disk.</p>
+    <div class="scen">
+      <div class="scen-item reveal d1"><span class="s-ico">📦</span><div><h4>Running untrusted open-source</h4><p>Clone it, poke at it. If it's malware, it can't reach your keys or phone home.<br><span class="tag run">airlock run</span></p></div></div>
+      <div class="scen-item reveal d2"><span class="s-ico">🚀</span><div><h4>Deploying for clients</h4><p>Every spin is logged out — <code>vercel login</code> fresh as the right client, no mix-ups.<br><span class="tag run">airlock run</span></p></div></div>
+      <div class="scen-item reveal d1"><span class="s-ico">🧪</span><div><h4>A sketchy curl | bash installer</h4><p>That one-liner install script runs contained instead of as you.<br><span class="tag run">airlock run</span></p></div></div>
+      <div class="scen-item reveal d2"><span class="s-ico">🐧</span><div><h4>Reproducing a Linux-only bug</h4><p>From your Mac, without dual-booting. Path casing, native modules, line endings.<br><span class="tag dev">airlock dev</span></p></div></div>
+      <div class="scen-item reveal d1"><span class="s-ico">☠️</span><div><h4>Genuinely hostile code / malware</h4><p>A microVM with its own kernel — even a container-escape 0-day can't reach your Mac.<br><span class="tag sbx">airlock sbx</span></p></div></div>
+      <div class="scen-item reveal d2"><span class="s-ico">🤖</span><div><h4>An autonomous AI agent with a shell</h4><p>Give it room to work behind a hardware-enforced boundary and a tight whitelist.<br><span class="tag sbx">airlock sbx</span></p></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== QUICK START ===================== -->
+<section id="quickstart" style="padding-top:0">
+  <div class="wrap two-col top">
+    <div>
+      <span class="eyebrow reveal">Quick start</span>
+      <h2 class="sec-title reveal d1">Two commands. <span class="grad-text">That's the whole flow.</span></h2>
+      <p class="sec-sub reveal d2">The folder you launch from becomes <code class="k-safe">/workspace</code> — the only host folder the container can ever see.</p>
+      <div class="reveal d3" style="margin-top:24px;display:flex;flex-direction:column;gap:16px">
+        <div class="scen-item" style="cursor:default"><span class="s-ico">①</span><div><h4>Bind dev servers to 0.0.0.0</h4><p>Ports 3000 · 3001 · 5173 · 4000 · 8080 forward to your Mac. Use <code>-H 0.0.0.0</code> / <code>--host 0.0.0.0</code>.</p></div></div>
+        <div class="scen-item" style="cursor:default"><span class="s-ico">②</span><div><h4>Need a second terminal?</h4><p>Don't run <code>run</code> twice. Attach with <code>airlock exec</code> to jump into the same box.</p></div></div>
+        <div class="scen-item" style="cursor:default"><span class="s-ico">③</span><div><h4>Toolchain included</h4><p>Node 24.16 · pnpm · npm · nvm · git · ripgrep · Claude Code, plus vercel · netlify · heroku · firebase · wrangler.</p></div></div>
+      </div>
+    </div>
+    <div class="reveal d2">
+      <div class="terminal">
+        <div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span class="title">~/some/cloned/oss-project — bash</span></div>
+        <div class="body">
+<span class="cmt"># UNTRUSTED: clone something sketchy, run it safely</span><br>
+<span class="prompt">$</span> <span class="cmd">cd ~/some/cloned/oss-project</span><br>
+<span class="prompt">$</span> <span class="cmd">airlock run</span><br>
+<br>
+<span class="dim">  ────────────────────────────────────────────</span><br>
+  🔒 <span class="ok">airlock · UNTRUSTED</span>  <span class="dim">safe — locked-down</span><br>
+<span class="dim">  ────────────────────────────────────────────</span><br>
+  <b>path</b>     <span class="cy">/Users/you/some/oss-project</span><br>
+           <span class="dim">↳ the only host folder the box can see</span><br>
+  <b>network</b>  <span class="ok">whitelist only</span> <span class="dim">· 27 domains</span><br>
+  <b>secrets</b>  <span class="ok">none of your files</span> <span class="dim">· token only</span><br>
+  <b>claude</b>   <span class="ok">logged in</span> <span class="dim">(synced from Keychain)</span><br>
+<span class="dim">  ────────────────────────────────────────────</span><br>
+<br>
+<span class="prompt">node@airlock</span>:<span class="cy">/workspace</span>$ <span class="cmd">npm install</span><br>
+<span class="ok">✓</span> registry.npmjs.org <span class="dim">→ 200 allowed</span><br>
+<span class="prompt">node@airlock</span>:<span class="cy">/workspace</span>$ <span class="cmd">curl https://evil-cdn.net</span><br>
+<span class="bad">✗ 403 blocked</span> <span class="dim">— not on the whitelist</span><br>
+<span class="prompt">node@airlock</span>:<span class="cy">/workspace</span>$ <span class="cmd">npm run dev -- -H 0.0.0.0</span><br>
+<span class="dim">▲ ready on</span> <span class="cy">http://localhost:3000</span> <span class="typing" id="cursor"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== COMMANDS ===================== -->
+<section id="commands">
+  <div class="wrap">
+    <span class="eyebrow reveal">Reference</span>
+    <h2 class="sec-title reveal d1">Every <span class="grad-text">command</span>.</h2>
+    <p class="sec-sub reveal d2">Pass a one-off command instead of a shell anytime: <code class="k-safe">airlock run npm test</code>, <code class="k-safe">airlock dev claude</code>, <code class="k-safe">airlock exec vercel deploy</code>. Full source: <a href="https://github.com/syedtasavour/airlock/blob/main/airlock" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">the airlock CLI ↗</a></p>
+    <div class="cmd-table reveal d3">
+      <div class="cmd-group-label">Enter a sandbox</div>
+      <div class="cmd-row"><code>airlock run [cmd]</code><span class="desc">🔒 UNTRUSTED mode — no history, whitelist-only network.</span></div>
+      <div class="cmd-row"><code>airlock dev [cmd]</code><span class="desc">⚠️ TRUSTED mode — Claude login + history, full internet.</span></div>
+      <div class="cmd-row"><code>airlock sbx [cmd]</code><span class="desc">🧊 STRONGEST — Docker microVM (own kernel) + the same whitelist.</span></div>
+      <div class="cmd-row"><code>airlock exec [cmd]</code><span class="desc">Open another terminal into the already-running sandbox.</span></div>
+      <div class="cmd-group-label">Network</div>
+      <div class="cmd-row"><code>airlock allow &lt;domain&gt;</code><span class="desc">Add a domain to the egress whitelist, then <code class="k-sbx">airlock rebuild</code>.</span></div>
+      <div class="cmd-row"><code>airlock blocked</code><span class="desc">List the URLs/hosts the proxy denied — works even after you exit.</span></div>
+      <div class="cmd-row"><code>airlock logs</code><span class="desc">Follow proxy logs live — watch what's allowed and blocked.</span></div>
+      <div class="cmd-group-label">Lifecycle</div>
+      <div class="cmd-row"><code>airlock sbx --fresh</code><span class="desc">Delete this project's old microVM and start a clean one.</span></div>
+      <div class="cmd-row"><code>airlock sbx down</code><span class="desc">Destroy just this project's microVM.</span></div>
+      <div class="cmd-row"><code>airlock down</code><span class="desc">Stop &amp; remove everything — run/dev containers, proxy, all sbx microVMs.</span></div>
+      <div class="cmd-group-label">Manage &amp; info</div>
+      <div class="cmd-row"><code>airlock status</code><span class="desc">Dashboard: images, what's running (🔒 SAFE / ⚠ TRUSTED), and the whitelist.</span></div>
+      <div class="cmd-row"><code>airlock build / rebuild</code><span class="desc">Build images — <code>rebuild</code> is from scratch, no cache (apply a new whitelist).</span></div>
+      <div class="cmd-row"><code>airlock help</code><span class="desc">Show help — also <code>--help</code>, <code>-h</code>.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== NETWORK ===================== -->
+<section id="network">
+  <div class="wrap two-col">
+    <div>
+      <span class="eyebrow reveal">Networking</span>
+      <h2 class="sec-title reveal d1">Default-deny. <span class="grad-text">By design.</span></h2>
+      <p class="sec-sub reveal d2">In <b class="k-safe">run</b> mode the sandbox has <strong class="ink">no direct internet</strong>. It sits on an internal Docker network and can only reach a tiny <code class="k-safe">tinyproxy</code> that forwards a request <strong class="ink">only if the destination host matches a rule</strong> — including HTTPS, by filtering the <code>CONNECT</code> host.</p>
+      <p class="sec-sub reveal d3" style="margin-top:18px">Default whitelist covers npm · yarn · pip · cargo, GitHub · GitLab, common deploy targets (Vercel, Netlify, Heroku, Cloudflare, Firebase) and Anthropic. Edit it in <a href="https://github.com/syedtasavour/airlock/blob/main/proxy/filter" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">proxy/filter</a>, or:</p>
+      <div class="reveal d4" style="margin-top:22px;display:flex;flex-direction:column;gap:10px">
+        <code class="codeblock"><span style="color:var(--ink)">airlock blocked</span>  <span style="color:var(--ink-faint)"># lists denied hosts as URLs</span></code>
+        <code class="codeblock"><span style="color:var(--ink)">airlock allow files.example.com</span></code>
+        <code class="codeblock"><span style="color:var(--ink)">airlock rebuild</span>  <span style="color:var(--ink-faint)"># bake it into the proxy image</span></code>
+      </div>
+    </div>
+    <div class="reveal d2">
+      <div class="terminal">
+        <div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span class="title">airlock — egress proxy</span></div>
+        <div class="body">
+<span class="cmt"># tinyproxy · FilterDefaultDeny Yes</span><br>
+<span class="ok">github.com</span>            <span class="dim">→</span> <span class="ok">HTTP 200  (allowed)</span><br>
+<span class="ok">registry.npmjs.org</span>    <span class="dim">→</span> <span class="ok">HTTP 200  (allowed)</span><br>
+<span class="bad">example.com</span>           <span class="dim">→</span> <span class="bad">403 blocked</span><br>
+<span class="bad">tracker.evil-test.io</span>  <span class="dim">→</span> <span class="bad">403 blocked</span><br>
+<br>
+<span class="cmt"># $ airlock blocked</span><br>
+<span class="dim">  Denied — not on the whitelist:</span><br>
+    <span class="bad">✗</span> <span class="cy">https://tracker.evil-test.io</span>   <span class="dim">1×</span><br>
+    <span class="bad">✗</span> <span class="cy">https://some-cdn.attacker.net</span>  <span class="dim">1×</span><br>
+        </div>
+      </div>
+      <p class="mono reveal" style="font-size:.78rem;color:var(--ink-faint);margin-top:16px;text-align:center">Exit <code class="k-safe">run</code> and the proxy + its network are torn down automatically — nothing internet-connected lingers.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== SETUP ===================== -->
+<section id="setup">
+  <div class="wrap">
+    <span class="eyebrow reveal">Setup · fresh or reset Mac</span>
+    <h2 class="sec-title reveal d1">Up and running in <span class="grad-text">three steps</span>.</h2>
+    <p class="sec-sub reveal d2">Wipe or replace your Mac and you get airlock back the same way. <a href="https://github.com/syedtasavour/airlock/blob/main/setup.sh" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">setup.sh</a> is idempotent and safe to re-run.</p>
+    <div class="steps">
+      <div class="step reveal d1"><div class="num">1</div><h4>Restore the folder</h4><p>From backup or git clone. The token re-syncs from your Keychain — it's never backed up.</p><code>git clone &lt;your-repo&gt; ~/sandbox/airlock</code></div>
+      <div class="step reveal d2"><div class="num">2</div><h4>Run setup</h4><p>Checks Docker, makes the <code class="k-sbx">airlock</code> alias, creates <code class="k-sbx">.secrets/</code>, builds images, self-tests the whitelist.</p><code>bash ~/sandbox/airlock/setup.sh</code></div>
+      <div class="step reveal d3"><div class="num">3</div><h4>Open a terminal &amp; go</h4><p>First run pops a Keychain prompt → <b class="ink">Always Allow</b>.</p><code>cd &lt;a project&gt; &amp;&amp; airlock run</code></div>
+    </div>
+
+    <h2 class="sec-title reveal" style="margin-top:80px;font-size:clamp(1.5rem,3vw,2rem)">Claude login, handled safely</h2>
+    <p class="sec-sub reveal d1">macOS keeps your Claude login in the <strong class="ink">Keychain</strong>, not a file. airlock exports it to a <code class="k-safe">chmod 600</code>, git-ignored secret, mounts it read-only, and copies it into the container's ephemeral home. Token refreshes stay inside the box and are <strong class="ink">never written back</strong> to your Mac. <code class="k-trust">dev</code> mounts your full <code>~/.claude</code> history; <code class="k-safe">run</code> mounts <strong class="ink">only the token</strong> — see <a href="https://github.com/syedtasavour/airlock/blob/main/entrypoint.sh" target="_blank" rel="noopener noreferrer" style="color:var(--sbx);text-decoration:underline">entrypoint.sh</a>.</p>
+  </div>
+</section>
+
+<!-- ===================== SECURITY + LAYOUT ===================== -->
+<section id="security">
+  <div class="wrap">
+    <span class="eyebrow reveal">Security model — and its limits</span>
+    <h2 class="sec-title reveal d1">Honest about the <span class="grad-text">boundary</span>.</h2>
+    <p class="sec-sub reveal d2">airlock raises the cost of an attack significantly — but it's not a guarantee. Here's exactly what it does and doesn't cover.</p>
+    <div class="split">
+      <div class="panel-card good reveal d1">
+        <h3>✓ What it protects against</h3>
+        <ul>
+          <li><b>Secret theft.</b> A dependency reading your home directory and keys — only the project is mounted.</li>
+          <li><b>Exfiltration.</b> Sending data out — egress is whitelist-only and default-deny.</li>
+          <li><b>Persistence.</b> Read-only root + throwaway container leave nothing behind.</li>
+          <li><b>Resource exhaustion.</b> CPU / memory / PID caps blunt fork bombs and runaway builds.</li>
+          <li><b>Kernel escape (sbx).</b> The microVM's own kernel contains even a container-escape 0-day.</li>
+        </ul>
+      </div>
+      <div class="panel-card warn reveal d2">
+        <h3>! What it does <em style="font-style:normal">not</em></h3>
+        <ul>
+          <li><b>Shared kernel in run / dev.</b> A kernel-level 0-day would defeat a container. Use <b class="k-sbx">sbx</b> for max isolation.</li>
+          <li><b>The project dir is read-write.</b> Untrusted code can modify the folder you opened — it can't touch anything else.</li>
+          <li><b>Whitelisted domains are trusted.</b> GitHub / npm can host arbitrary content. Keep the list tight.</li>
+          <li><b>The Claude token is present in run.</b> Set <code>AIRLOCK_SEED_CLAUDE=0</code> if that matters; revoke with <code>/logout</code>.</li>
+          <li><b>dev is not for untrusted code.</b> Full internet + your history. Use <b class="k-safe">run</b> or <b class="k-sbx">sbx</b>.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 class="sec-title reveal" style="margin-top:80px;font-size:clamp(1.5rem,3vw,2rem)">What's in the box</h2>
+    <p class="sec-sub reveal d1">One host CLI plus Docker plumbing — auditable end to end. Each file links to its source on GitHub.</p>
+    <div class="tree reveal d2">
+<span class="dir">syedtasavour/airlock/</span><br>
+├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/airlock" target="_blank" rel="noopener noreferrer">airlock</a>              <span class="note"># the host CLI (aliased as `airlock`)</span><br>
+├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/setup.sh" target="_blank" rel="noopener noreferrer">setup.sh</a>             <span class="note"># one-shot restore on a fresh/reset Mac</span><br>
+├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/Dockerfile" target="_blank" rel="noopener noreferrer">Dockerfile</a>           <span class="note"># sandbox image (Node + deploy CLIs + Claude)</span><br>
+├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/docker-compose.yml" target="_blank" rel="noopener noreferrer">docker-compose.yml</a>   <span class="note"># run/dev profiles + proxy + networks + limits</span><br>
+├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/entrypoint.sh" target="_blank" rel="noopener noreferrer">entrypoint.sh</a>        <span class="note"># seeds Claude login (token-only in run)</span><br>
+├── <span class="dir">proxy/</span><br>
+│&nbsp;&nbsp;&nbsp;├── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/proxy/tinyproxy.conf" target="_blank" rel="noopener noreferrer">tinyproxy.conf</a>   <span class="note"># default-deny egress config</span><br>
+│&nbsp;&nbsp;&nbsp;└── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/proxy/filter" target="_blank" rel="noopener noreferrer">filter</a>           <span class="note"># the domain whitelist (`airlock allow`)</span><br>
+├── <span class="note">.secrets/            # exported Claude token (git-ignored, 600)</span><br>
+└── <a class="file" href="https://github.com/syedtasavour/airlock/blob/main/README.md" target="_blank" rel="noopener noreferrer">README.md</a>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== REFERENCES ===================== -->
+<section id="references">
+  <div class="wrap">
+    <span class="eyebrow reveal">References · verify everything</span>
+    <h2 class="sec-title reveal d1">Sources &amp; <span class="grad-text">further reading</span>.</h2>
+    <p class="sec-sub reveal d2">Primary advisories and reporting from established platforms — government (CISA), the npm registry itself, Anthropic's engineering team, and major security press. Nothing here is second-hand.</p>
+    <div class="refs reveal d3">
+      <a class="ref" href="https://www.cisa.gov/news-events/alerts/2021/10/22/malware-discovered-popular-npm-package-ua-parser-js" target="_blank" rel="noopener noreferrer"><span class="ref-num">01</span><span class="ref-title">Malware Discovered in Popular NPM Package, ua-parser-js<span>Official US government advisory, 2021</span></span><span class="ref-src">CISA</span></a>
+      <a class="ref" href="https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem" target="_blank" rel="noopener noreferrer"><span class="ref-num">02</span><span class="ref-title">Widespread Supply Chain Compromise Impacting the npm Ecosystem<span>Ecosystem-wide alert, 2025 (Shai-Hulud)</span></span><span class="ref-src">CISA</span></a>
+      <a class="ref" href="https://blog.npmjs.org/post/180565383195/details-about-the-event-stream-incident" target="_blank" rel="noopener noreferrer"><span class="ref-num">03</span><span class="ref-title">Details about the event-stream incident<span>Primary post-incident report from the registry</span></span><span class="ref-src">npm blog</span></a>
+      <a class="ref" href="https://snyk.io/blog/a-post-mortem-of-the-malicious-event-stream-backdoor/" target="_blank" rel="noopener noreferrer"><span class="ref-num">04</span><span class="ref-title">A post-mortem of the malicious event-stream backdoor<span>Technical teardown, 2018</span></span><span class="ref-src">Snyk</span></a>
+      <a class="ref" href="https://www.theregister.com/2018/11/26/npm_repo_bitcoin_stealer/" target="_blank" rel="noopener noreferrer"><span class="ref-num">05</span><span class="ref-title">Crypto-coin-stealing code sneaks into popular npm lib<span>Contemporary reporting, 2018</span></span><span class="ref-src">The Register</span></a>
+      <a class="ref" href="https://www.rapid7.com/blog/post/2021/10/25/npm-library-ua-parser-js-hijacked-what-you-need-to-know/" target="_blank" rel="noopener noreferrer"><span class="ref-num">06</span><span class="ref-title">npm library (ua-parser-js) hijacked: what you need to know<span>Vendor analysis, 2021</span></span><span class="ref-src">Rapid7</span></a>
+      <a class="ref" href="https://www.bleepingcomputer.com/news/security/big-sabotage-famous-npm-package-deletes-files-to-protest-ukraine-war/" target="_blank" rel="noopener noreferrer"><span class="ref-num">07</span><span class="ref-title">Famous npm package deletes files to protest the Ukraine war<span>node-ipc protestware, 2022</span></span><span class="ref-src">BleepingComputer</span></a>
+      <a class="ref" href="https://snyk.io/blog/peacenotwar-malicious-npm-node-ipc-package-vulnerability/" target="_blank" rel="noopener noreferrer"><span class="ref-num">08</span><span class="ref-title">peacenotwar sabotages npm developers in the node-ipc package<span>CVE-2022-23812 analysis</span></span><span class="ref-src">Snyk</span></a>
+      <a class="ref" href="https://unit42.paloaltonetworks.com/npm-supply-chain-attack/" target="_blank" rel="noopener noreferrer"><span class="ref-num">09</span><span class="ref-title">"Shai-Hulud" worm compromises the npm ecosystem<span>Self-propagating supply-chain worm, 2025</span></span><span class="ref-src">Palo Alto Unit 42</span></a>
+      <a class="ref" href="https://www.anthropic.com/engineering/claude-code-sandboxing" target="_blank" rel="noopener noreferrer"><span class="ref-num">10</span><span class="ref-title">Making Claude Code more secure and autonomous with sandboxing<span>The filesystem + network isolation model</span></span><span class="ref-src">Anthropic</span></a>
+      <a class="ref" href="https://www.anthropic.com/engineering/how-we-contain-claude" target="_blank" rel="noopener noreferrer"><span class="ref-num">11</span><span class="ref-title">How we contain Claude across products<span>Containment philosophy &amp; primitives</span></span><span class="ref-src">Anthropic</span></a>
+      <a class="ref" href="https://github.com/anthropic-experimental/sandbox-runtime" target="_blank" rel="noopener noreferrer"><span class="ref-num">12</span><span class="ref-title">sandbox-runtime — OS-level filesystem &amp; network restrictions<span>Open-source reference implementation</span></span><span class="ref-src">GitHub · Anthropic</span></a>
+      <a class="ref" href="https://thehackernews.com/2026/06/github-to-disable-npm-install-scripts.html" target="_blank" rel="noopener noreferrer"><span class="ref-num">13</span><span class="ref-title">GitHub to disable npm install scripts by default<span>Ecosystem moving to "secure by default", 2026</span></span><span class="ref-src">The Hacker News</span></a>
+      <a class="ref" href="https://www.nodejs-security.com/blog/npm-ignore-scripts-best-practices-as-security-mitigation-for-malicious-packages" target="_blank" rel="noopener noreferrer"><span class="ref-num">14</span><span class="ref-title">npm ignore-scripts best practices as a mitigation<span>Why install scripts are the biggest risk surface</span></span><span class="ref-src">nodejs-security</span></a>
+    </div>
+    <p class="mono reveal d2" style="font-size:.78rem;color:var(--ink-faint);margin-top:18px">Links open on the original publishers' sites. airlock is independent and not affiliated with, or endorsed by, any organization listed above.</p>
+  </div>
+</section>
+
+<!-- ===================== CTA ===================== -->
+<section>
+  <div class="wrap">
+    <div class="cta-banner reveal">
+      <span class="eyebrow" style="margin-bottom:18px">Ship safer, today</span>
+      <h2>Stop running strangers' code<br>as <span class="grad-text">yourself</span>.</h2>
+      <p>Clone it. <code class="k-safe">airlock run</code>. Poke at it. If it's malware, it can't reach your keys or phone home. Then it's gone.</p>
+      <div class="hero-cta" style="justify-content:center">
+        <a href="https://github.com/syedtasavour/airlock" target="_blank" rel="noopener noreferrer" class="btn btn-primary">View airlock on GitHub →</a>
+        <a href="#commands" class="btn btn-ghost">Browse the commands</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== FOOTER ===================== -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <a href="#top" class="brand" style="font-size:1.3rem"><span class="shield">🛡️</span> airlock</a>
+        <p class="foot-blurb">A disposable, hardened Linux sandbox for running untrusted code and deploying with throwaway CLI logins — the same filesystem-isolation + egress-control model Anthropic uses to contain Claude Code.</p>
+        <a href="https://github.com/syedtasavour/airlock" target="_blank" rel="noopener noreferrer" class="foot-gh">
+          <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          View on GitHub →
+        </a>
+      </div>
+      <div>
+        <h5>Product</h5>
+        <a href="#why">Why it matters</a>
+        <a href="#attacks">In the wild</a>
+        <a href="#modes">Three modes</a>
+        <a href="#commands">Commands</a>
+      </div>
+      <div>
+        <h5>Operate</h5>
+        <a href="#network">Networking</a>
+        <a href="#setup">Setup &amp; login</a>
+        <a href="#security">Security model</a>
+        <a href="#references">References</a>
+      </div>
+      <div>
+        <h5>Source</h5>
+        <a href="https://github.com/syedtasavour/airlock/blob/main/airlock" target="_blank" rel="noopener noreferrer">airlock CLI ↗</a>
+        <a href="https://github.com/syedtasavour/airlock/blob/main/Dockerfile" target="_blank" rel="noopener noreferrer">Dockerfile ↗</a>
+        <a href="https://github.com/syedtasavour/airlock/blob/main/proxy/filter" target="_blank" rel="noopener noreferrer">proxy/filter ↗</a>
+        <a href="https://github.com/syedtasavour/airlock/issues" target="_blank" rel="noopener noreferrer">Issues ↗</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© <span id="year">2026</span> Syed Tasavour · Personal developer tooling. Free to copy, modify &amp; reuse.</span>
+      <span class="mono">filesystem isolation + network egress control</span>
+    </div>
+    <p class="disclaimer">Provided <strong style="color:var(--ink-dim)">as-is, without warranty of any kind</strong>. airlock raises the cost of an attack significantly but is not a guarantee of safety — see the security model and its limits above. You are responsible for the code you run and the domains you whitelist. Third-party names and reports are the property of their respective owners; references are provided for verification and education.</p>
+  </div>
+</footer>
+
+<script src="assets/js/particles.js" defer></script>
+<script src="assets/js/main.js" defer></script>
+</body>
+</html>

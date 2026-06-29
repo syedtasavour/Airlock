@@ -1,0 +1,91 @@
+/* ============================================================
+   airlock · base.css
+   Design tokens, reset, typography, and animated backgrounds.
+   ============================================================ */
+:root{
+  --bg:#05070d;
+  --bg-soft:#0a0e1a;
+  --panel:#0d1322;
+  --panel-2:#111a2e;
+  --line:rgba(120,150,200,.14);
+  --line-strong:rgba(120,150,200,.28);
+  --ink:#eef3ff;
+  --ink-dim:#9fb0cc;
+  --ink-faint:#647089;
+  --safe:#2dd673;       /* run / untrusted-safe (green) */
+  --safe-glow:rgba(45,214,115,.5);
+  --trust:#ffb02e;      /* dev / trusted (amber)        */
+  --sbx:#34d6ff;        /* microVM (cyan)               */
+  --sbx-glow:rgba(52,214,255,.5);
+  --danger:#ff5470;
+  --danger-glow:rgba(255,84,112,.4);
+  --violet:#9b7bff;
+  --maxw:1180px;
+  --radius:18px;
+  --ease:cubic-bezier(.22,1,.36,1);
+  --font:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  font-family:var(--font);
+  background:var(--bg);
+  color:var(--ink);
+  line-height:1.65;
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+img,svg{max-width:100%;display:block}
+a{color:inherit;text-decoration:none}
+code{font-family:var(--mono)}
+::selection{background:var(--safe);color:#04210f}
+::-webkit-scrollbar{width:11px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:#1c2942;border-radius:20px;border:3px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#2a3d63}
+
+/* ---- skip link (a11y) ---- */
+.skip{position:absolute;left:-999px;top:0;z-index:200;background:var(--safe);color:#04210f;padding:10px 16px;border-radius:0 0 10px 0;font-weight:700}
+.skip:focus{left:0}
+:focus-visible{outline:2px solid var(--safe);outline-offset:3px;border-radius:6px}
+
+/* ---- animated backgrounds ---- */
+.bg-canvas{position:fixed;inset:0;z-index:-3;pointer-events:none}
+.bg-aurora{
+  position:fixed;inset:-30%;z-index:-2;pointer-events:none;filter:blur(90px);opacity:.5;
+  background:
+    radial-gradient(40% 35% at 18% 22%, rgba(45,214,115,.30), transparent 60%),
+    radial-gradient(38% 32% at 82% 18%, rgba(52,214,255,.26), transparent 60%),
+    radial-gradient(45% 40% at 70% 85%, rgba(155,123,255,.22), transparent 60%),
+    radial-gradient(35% 30% at 25% 80%, rgba(255,176,46,.16), transparent 60%);
+  animation:auroraDrift 26s var(--ease) infinite alternate;
+}
+@keyframes auroraDrift{
+  0%{transform:translate3d(0,0,0) scale(1)}
+  50%{transform:translate3d(2%,-2%,0) scale(1.08)}
+  100%{transform:translate3d(-2%,2%,0) scale(1.04)}
+}
+.bg-grid{
+  position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+  background-image:
+    linear-gradient(rgba(120,150,200,.05) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(120,150,200,.05) 1px,transparent 1px);
+  background-size:54px 54px;
+  -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 80%);
+          mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 80%);
+}
+
+/* ---- shared text helpers ---- */
+.grad-text{background:linear-gradient(110deg,var(--safe),var(--sbx) 55%,var(--violet));-webkit-background-clip:text;background-clip:text;color:transparent}
+.mono{font-family:var(--mono)}
+.k-safe{color:var(--safe)}.k-trust{color:var(--trust)}.k-sbx{color:var(--sbx)}.k-danger{color:var(--danger)}
+.ink{color:var(--ink)}
+
+/* ---- reduced motion ---- */
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001s!important;animation-iteration-count:1!important;transition-duration:.001s!important;scroll-behavior:auto!important}
+  .reveal{opacity:1!important;transform:none!important}
+}

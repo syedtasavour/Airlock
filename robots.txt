@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://syedtasavour.github.io/Airlock/sitemap.xml

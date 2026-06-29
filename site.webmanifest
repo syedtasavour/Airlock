@@ -1,0 +1,13 @@
+{
+  "name": "airlock — disposable hardened sandbox",
+  "short_name": "airlock",
+  "description": "A disposable, hardened Linux sandbox for running untrusted code without exposing your keys, files, or secrets.",
+  "start_url": "/Airlock/",
+  "scope": "/Airlock/",
+  "display": "standalone",
+  "background_color": "#05070d",
+  "theme_color": "#05070d",
+  "icons": [
+    { "src": "assets/img/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
