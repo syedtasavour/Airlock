@@ -2,8 +2,8 @@
 # deploying with throwaway CLI logins. Ships Vercel / Netlify / Heroku /
 # Firebase / Wrangler + Claude Code.
 # Runs as a NON-ROOT user; the root filesystem is mounted read-only by compose.
-# Default Node is pinned to 24.16; nvm is available inside to switch versions.
-FROM node:24.16-bookworm
+# Default Node is pinned to 24.22.3; nvm is available inside to switch versions.
+FROM node:24.22.3-bookworm
 
 # --- base tooling -----------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
