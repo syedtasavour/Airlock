@@ -335,6 +335,8 @@ airlock clean       free disk: leftovers, old builds, package caches (also daily
 airlock down        stop & remove THIS project's sandbox + proxy
 airlock down --all  stop & remove every airlock project on this machine
 airlock off         down --all, then quit Docker Desktop (frees its RAM)
+airlock reboot      stop every sandbox + restart Docker, like a PC reboot (logins/caches kept)
+  reboot run|dev    …then start this project's sandbox fresh
 airlock login       store a long-lived Claude token (no "Login expired")
 airlock logout      remove that token
 airlock status      show images, what's running, and whether it's SAFE

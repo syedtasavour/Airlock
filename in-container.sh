@@ -54,6 +54,7 @@ cat <<EOF
     airlock run | dev       start a sandbox here    airlock exec    another terminal into it
     airlock allow           unblock a site          airlock blocked what was blocked
     airlock status          what's running          airlock disk    Docker disk usage
-    airlock update          latest Node/Claude/CLIs airlock help    everything else
+    airlock update          latest Node/Claude/CLIs airlock reboot  restart everything fresh
+    airlock help            everything else
 
 EOF

@@ -848,6 +848,8 @@ print_help() {
     down             stop & remove THIS project's sandbox + proxy
     down --all       stop & remove every airlock project on this machine
     off              down --all, then quit Docker Desktop — gives its RAM back
+    reboot [run|dev] stop everything + restart Docker, like a PC reboot (keeps logins/caches);
+                     with run/dev, start this project's sandbox fresh afterwards
     build            build images
     rebuild          build images from scratch (no cache)
     update           latest Node LTS, Claude Code, npm/pnpm and deploy CLIs
@@ -1052,6 +1054,48 @@ case "$cmd" in
     fi
     echo "${DIM}› home volumes are kept — wipe one with: airlock reset [client]${N}"
     echo "› done"
+    ;;
+
+  reboot|restart)
+    # Like shutting a PC down and starting it again: every airlock sandbox and
+    # proxy stops, their containers and networks go, Docker's VM restarts
+    # (memory and engine state cleared), and it waits until Docker is back.
+    # Kept, like a disk across a reboot: home volumes (logins, caches,
+    # history), images, the whitelist. `airlock reboot run|dev` then starts
+    # this project's sandbox fresh.
+    set_identity
+    yes=0
+    case "${1:-}" in -y|--yes) yes=1; shift ;; esac
+    t0=$(date +%s)
+    if docker_running; then
+      live="$(docker ps --format '{{.Names}}' --filter "name=^airlock-" 2>/dev/null | grep -E -- '-(untrusted|dev)-run' || true)"
+      if [ -n "$live" ] && [ "$yes" = 0 ] && [ -t 0 ]; then
+        echo "  ${Y}these sandboxes are open — their terminals will be closed:${N}"
+        printf '%s\n' "$live" | sed 's/^/    • /'
+        printf "  reboot anyway? [y/N] "; read -r ans || ans=""
+        case "$ans" in y|Y|yes) ;; *) echo "› cancelled"; exit 0 ;; esac
+      fi
+      echo "› stopping every airlock sandbox and proxy…"
+      down_all
+      echo "› restarting Docker (clears its VM memory and engine state)…"
+      if ! docker desktop restart >/dev/null 2>&1; then
+        docker desktop stop >/dev/null 2>&1 || osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+      fi
+      # Make sure the OLD engine is really gone before waiting for the new one.
+      for i in $(seq 1 30); do docker_running || break; sleep 1; done
+    else
+      echo "› Docker was stopped — starting it fresh…"
+    fi
+    ensure_docker
+    # Anything that survived (crashed containers, orphaned networks).
+    docker ps -aq --filter "name=^airlock-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker network ls --format '{{.Name}}' | grep '^airlock-' | xargs -r -n1 docker network rm >/dev/null 2>&1 || true
+    echo "› ${G}rebooted${N} in $(( $(date +%s) - t0 ))s — Docker is fresh, no airlock containers running."
+    echo "  ${DIM}kept: home volumes (logins, caches, history), images, whitelist${N}"
+    case "${1:-}" in
+      run|dev) echo "› starting this project's $1 sandbox…"; exec "$DIR/airlock" "$@" ;;
+      "") echo "  start again with: airlock run   (or: airlock dev)" ;;
+    esac
     ;;
 
   off)
