@@ -66,21 +66,30 @@ add_alias() {
 add_alias "$HOME/.zshrc"
 add_alias "$HOME/.bashrc"
 
+# 4b) habit guard: npm/pnpm/yarn/npx/bun/node typed inside a project on the
+# Mac asks to run in airlock instead. Undo any time: airlock guard off
+"$DIR/airlock" guard on | sed 's/^/  /'
+
 # 5) build images -------------------------------------------------------------
 echo ""
 echo "▶ building images (first build ~3–5 min)…"
-( cd "$DIR" && docker compose --profile run --profile dev build )
+( cd "$DIR" && docker compose -f docker-compose.yml -f docker-compose.home-persistent.yml \
+    --profile run --profile dev build )
 
 # 6) quick self-test: whitelist blocks a random host --------------------------
 echo ""
 echo "▶ self-test: confirming the egress whitelist blocks unknown hosts…"
-if WORKSPACE=/tmp docker compose -f "$DIR/docker-compose.yml" --profile run run --rm -T untrusted \
+mkdir -p "$DIR/.state/selftest" "$DIR/.state/no-sessions/memory"
+# not /tmp: the sandbox mounts the project at its own path, and /tmp is its tmpfs
+if WORKSPACE="$DIR/.state/selftest" docker compose -f "$DIR/docker-compose.yml" \
+     -f "$DIR/docker-compose.home-ephemeral.yml" --profile run run --rm -T untrusted \
      bash -c 'curl -sS -o /dev/null --max-time 15 https://example.com' >/dev/null 2>&1; then
   echo "⚠️  warning: example.com was reachable — whitelist may not be enforcing!"
 else
   echo "✓ blocked example.com as expected"
 fi
-( cd "$DIR" && docker compose --profile run down --remove-orphans >/dev/null 2>&1 || true )
+( cd "$DIR" && docker compose -f docker-compose.yml -f docker-compose.home-ephemeral.yml \
+    --profile run down --remove-orphans >/dev/null 2>&1 || true )
 
 cat <<EOF
 
@@ -89,10 +98,16 @@ cat <<EOF
    Open a NEW terminal (or run: source ~/.zshrc), then:
 
      cd <a project you want to run>
-     airlock run      # UNTRUSTED: locked down, whitelist network
-     airlock dev      # YOUR code: Claude + full internet
-     airlock status   # see what's running and whether it's safe
-     airlock --help   # all commands
+     airlock run              # UNTRUSTED: locked down, whitelist network
+     airlock dev              # YOUR code: full internet
+     airlock run --ephemeral  # deploy sessions: logins die on exit
+     airlock status           # what's running, ports, client home volumes
+     airlock disk             # what's using Docker's disk (cleans itself daily)
+     airlock --help           # all commands
+
+   Multi-client: each project gets its own ports + proxy; each client gets its
+   own home volume (caches + Claude history), resolved from \$AIRLOCK_CLIENT,
+   a .airlock-client file, or the project's parent directory name.
 
    First run pops a macOS Keychain prompt for your Claude login → "Always Allow".
 EOF

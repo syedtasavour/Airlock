@@ -5,29 +5,38 @@
 #   airlock run [CMD]   UNTRUSTED mode: no host secrets, locked-down, egress
 #                       only through a domain whitelist proxy. For OSS you don't
 #                       trust. (alias: `airlock shell`)
-#   airlock dev [CMD]   TRUSTED mode: your Claude login works, full internet.
+#   airlock dev [CMD]   TRUSTED mode: your Claude login works, full internet,
+#                       and Claude history/memory are your Mac's ~/.claude.
 #                       For your own code.
-#   airlock sbx [CMD]   STRONGEST mode: a Docker microVM (own kernel) running the
-#                       project with airlock's same egress whitelist. Escape-proof
-#                       + exfil-proof. Needs `docker sandbox` (Docker Desktop 4.58+).
-#                       KEPT & reused by default so login/installs persist:
-#                         airlock sbx --fresh   delete the old box, start a new one
-#                         airlock sbx down      destroy this project's microVM
+#   airlock sbx [CMD]   Docker microVM mode. NOTE: `docker sandbox` was removed
+#                       from Docker Desktop; this exits with guidance if the
+#                       subcommand is unavailable.
 #
 #   airlock exec [CMD]  open ANOTHER terminal into the running sandbox
-#   airlock allow DOM   add a domain to the egress whitelist (then rebuild)
-#   airlock down        stop & remove sandbox + proxy containers
+#   airlock allow DOM   add a domain to the egress whitelist (reloads the proxy)
+#   airlock reset [CL]  wipe a client's persistent home volume
+#   airlock login       store a long-lived Claude token (no "Login expired")
+#   airlock logout      remove it again
+#   airlock down        stop & remove this project's sandbox + proxy
+#   airlock off         stop everything and quit Docker Desktop (frees its RAM)
 #   airlock status      show images, running containers, whitelist
 #   airlock build       (re)build the images
 #   airlock rebuild     rebuild from scratch (no cache)
 #   airlock logs        follow proxy logs (see what egress is allowed/blocked)
 #   airlock help        this help   (also: --help, -h)
 #
-# run/dev are throwaway (--rm): each spin is fresh. Ports 3000/3001/5173/4000/8080
-# are published to the host so dev servers are reachable (bind to 0.0.0.0!).
+# MULTI-CLIENT MODEL
+#   Each PROJECT gets its own compose project -> its own proxy, its own
+#   isolated network, and its own hashed host ports, so two client sandboxes
+#   run side by side without clashing.
+#   Each CLIENT gets its own /home/node volume -> caches and Claude history
+#   persist per client and never leak between them. The client is resolved
+#   from $AIRLOCK_CLIENT, else a .airlock-client file in the project, else the
+#   name of the project's parent directory.
 set -euo pipefail
 
-# Directory you invoked airlock from -> becomes /workspace. Capture before cd.
+# Directory you invoked airlock from -> mounted at the same path inside
+# (both modes, so Claude sessions are filed per project). Capture before cd.
 INVOKE_DIR="$PWD"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
@@ -35,6 +44,9 @@ cd "$DIR"
 SANDBOX_IMAGE="syedtasavour/airlock-sandbox:latest"
 PROXY_IMAGE="syedtasavour/airlock-proxy:latest"
 FILTER="$DIR/proxy/filter"
+# Host-side bookkeeping: when each home volume was last used, the last
+# auto-clean, the disk warning shown in the banner. Git-ignored.
+STATE_DIR="$DIR/.state"
 
 # Colors (disabled when output isn't a terminal, e.g. piped).
 if [ -t 1 ]; then
@@ -52,48 +64,296 @@ readable_whitelist() {
     | sed -E 's/\$$//; s/^\^//; s/^\\\./*./; s/\\\././g' | sort -u
 }
 
-dc() { docker compose "$@"; }
-image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+# ---- compose plumbing ------------------------------------------------------
+# The base file declares no /home/node mount; exactly one home override is
+# always layered on top (see set_home_mode).
+COMPOSE_FILES=(-f "$DIR/docker-compose.yml" -f "$DIR/docker-compose.home-persistent.yml")
+HOME_MODE="persistent"
 
-ensure_built() {
-  if ! image_exists "$SANDBOX_IMAGE"; then
-    echo "› images not found — building (first time only)…"
-    dc --profile run --profile dev build
+set_home_mode() {
+  HOME_MODE="$1"
+  if [ "$1" = "ephemeral" ]; then
+    COMPOSE_FILES=(-f "$DIR/docker-compose.yml" -f "$DIR/docker-compose.home-ephemeral.yml")
+  else
+    COMPOSE_FILES=(-f "$DIR/docker-compose.yml" -f "$DIR/docker-compose.home-persistent.yml")
   fi
 }
 
-# Mount the dir you ran airlock from as /workspace. Refuse overly-broad roots.
+dc() { docker compose "${COMPOSE_FILES[@]}" "$@"; }
+# Your Mac's time zone, so times inside (status line, `date`, logs) match it.
+AIRLOCK_TZ="${TZ:-$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')}"; export AIRLOCK_TZ
+# Interactive shell inside the sandbox: zsh (same setup as your Mac), or bash
+# in an image built before zsh was added.
+SHELL_CMD=(sh -c 'exec "$(command -v zsh || command -v bash)"')
+image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+docker_running() { docker info >/dev/null 2>&1; }
+
+# Start Docker Desktop if it's stopped (e.g. after `airlock off`), instead of
+# failing with "Cannot connect to the Docker daemon".
+ensure_docker() {
+  docker_running && return 0
+  echo "${DIM}› Docker isn't running — starting Docker Desktop…${N}"
+  open -a Docker 2>/dev/null || { echo "${R}✗ couldn't start Docker Desktop${N}"; exit 1; }
+  local i
+  for i in $(seq 1 60); do
+    sleep 2
+    docker_running && return 0
+  done
+  echo "${R}✗ Docker didn't come up within 2 minutes${N}"
+  exit 1
+}
+
+# $1 = run|dev. `dev` never touches the proxy, so a flaky alpine/apk pull
+# must not abort it — that was a real intermittent failure of `airlock dev`.
+ensure_built() {
+  local mode="${1:-run}"
+  if ! image_exists "$SANDBOX_IMAGE"; then
+    echo "› sandbox image not found — building (first time only)…"
+    dc --profile dev build dev
+  fi
+  if [ "$mode" = run ] && ! image_exists "$PROXY_IMAGE"; then
+    echo "› proxy image not found — building…"
+    dc --profile run build proxy
+  fi
+}
+
+# ---- identity: client, project, ports --------------------------------------
+# Lowercase and strip anything docker compose won't accept in a project name.
+slugify() {
+  echo "$1" | tr '[:upper:].' '[:lower:]-' \
+    | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g; s/^[-_]*//; s/[-_]*$//'
+}
+
+# Which client's home volume this project uses.
+#   $AIRLOCK_CLIENT  >  .airlock-client in the project  >  parent dir name
+resolve_client() {
+  local c=""
+  if [ -n "${AIRLOCK_CLIENT:-}" ]; then
+    c="$AIRLOCK_CLIENT"
+  elif [ -f "$INVOKE_DIR/.airlock-client" ]; then
+    c="$(head -1 "$INVOKE_DIR/.airlock-client" 2>/dev/null || true)"
+  else
+    c="$(basename "$(dirname "$INVOKE_DIR")")"
+  fi
+  c="$(slugify "$c")"
+  echo "${c:-default}"
+}
+
+# ---- ports -------------------------------------------------------------------
+# Every well-known dev-server port is published, so whatever the project runs
+# is reachable from your Mac with no config:
+#   3000-3005  Next.js, CRA, Remix, Nuxt, Express, a 2nd/3rd app
+#   4000 4200  Gatsby/Phoenix/GraphQL, Angular       4173  vite preview
+#   4321       Astro                                 5000 5001  Flask, .NET, serve
+#   5173-5175  Vite (and its next free ports)        6006  Storybook
+#   8000       Django, FastAPI, Laravel              8080 8081  misc, Expo/Metro
+#   8787       wrangler dev                          9000  misc
+# Add your own for one project with a .airlock-ports file (space/newline
+# separated), or everywhere with AIRLOCK_EXTRA_PORTS="7000 7001".
+#
+# Each port maps 1:1 (host 3000 = container 3000) when it's free on your Mac,
+# so the URL a dev server prints is the URL that works. A port that's taken
+# (another project's box, or e.g. macOS AirPlay on 5000) moves on its own to
+# 1<port>, 2<port>, … (3000 -> 13000) — the others stay 1:1 — and the banner
+# says which. Published on 127.0.0.1 only: your Mac can reach the box's dev
+# servers; other machines on your Wi-Fi can't.
+DEFAULT_PORTS="3000 3001 3002 3003 3004 3005 4000 4173 4200 4321 5000 5001 5173 5174 5175 6006 8000 8080 8081 8787 9000"
+
+wanted_ports() {
+  local list="${AIRLOCK_PORTS:-$DEFAULT_PORTS} ${AIRLOCK_EXTRA_PORTS:-}"
+  [ -f "$INVOKE_DIR/.airlock-ports" ] && list="$list $(tr -c '0-9\n' ' ' < "$INVOKE_DIR/.airlock-ports")"
+  printf '%s\n' $list | grep -E '^[0-9]+$' | awk '$1 >= 1 && $1 <= 65535' | sort -un | tr '\n' ' '
+}
+
+port_busy() { nc -z -w1 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+# Launch-time only. A taken host port makes `docker compose run` fail outright,
+# so probe each one and move just the busy ones. Writes a compose override
+# with the result and layers it on. Sets PORTS_ONE, PORTS_MOVED, PORTS_FIRST.
+PORTS_ONE=""; PORTS_MOVED=""; PORTS_FIRST=""
+plan_ports() {  # $1 = untrusted|dev
+  local svc="$1" p h k file
+  file="$STATE_DIR/ports/${COMPOSE_PROJECT_NAME}-${svc}.yml"
+  mkdir -p "$STATE_DIR/ports"
+  { echo "# generated by airlock at launch — do not edit"
+    echo "services:"; echo "  ${svc}:"; echo "    ports:"
+    for p in $(wanted_ports); do
+      h=""
+      if ! port_busy "$p"; then h="$p"
+      else
+        for k in 1 2 3 4 5; do
+          [ $(( k * 10000 + p )) -le 65535 ] || break
+          port_busy $(( k * 10000 + p )) || { h=$(( k * 10000 + p )); break; }
+        done
+      fi
+      [ -n "$h" ] || continue   # nowhere free: leave this one out
+      echo "      - \"127.0.0.1:${h}:${p}\""
+      if [ "$h" = "$p" ]; then PORTS_ONE="$PORTS_ONE $p"; else PORTS_MOVED="${PORTS_MOVED} ${p}→${h}"; fi
+      [ -n "$PORTS_FIRST" ] || PORTS_FIRST="$h"
+    done
+  } > "$file"
+  COMPOSE_FILES+=(-f "$file")
+  AIRLOCK_FORWARD_PORTS="$(wanted_ports | tr ' ' ',' | sed 's/,$//')"; export AIRLOCK_FORWARD_PORTS
+}
+
+# "3000 3001 3002 3003 4000" -> "3000-3003 4000"
+compact_ports() {
+  printf '%s\n' $1 | sort -n | awk '
+    NR == 1 { s = e = $1; next }
+    $1 == e + 1 { e = $1; next }
+    { printf "%s ", (s == e ? s : s "-" e); s = e = $1 }
+    END { if (NR) printf "%s", (s == e ? s : s "-" e) }'
+}
+
+# Safe for every command: never refuses, never mutates anything.
+set_identity() {
+  export WORKSPACE="$INVOKE_DIR"
+  AIRLOCK_CLIENT="$(resolve_client)"; export AIRLOCK_CLIENT
+  PROJECT_SLUG="$(slugify "$(basename "$INVOKE_DIR")")"
+  COMPOSE_PROJECT_NAME="airlock-${PROJECT_SLUG:-ws}"
+  export COMPOSE_PROJECT_NAME
+}
+
+# Adds the "don't mount my whole home directory" guard. run/dev/sbx only.
 set_workspace() {
   if [ "$INVOKE_DIR" = "$HOME" ] || [ "$INVOKE_DIR" = "/" ]; then
     echo "${R}✗ refusing to mount '$INVOKE_DIR' (too broad). cd into a project first.${N}"
     exit 1
   fi
-  export WORKSPACE="$INVOKE_DIR"
+  set_identity
 }
+
+# $1 = untrusted|dev   $2 = client (default: this project's client)
+home_volume_name() { echo "airlock-home-${2:-$AIRLOCK_CLIENT}-${1:-untrusted}"; }
 
 # Export Claude login from the macOS Keychain into a local read-only file so the
 # sandbox can reuse it. Only ever read by the container; refreshes stay inside.
 # Sets CLAUDE_STATE (a colored summary) for the launch banner.
 CLAUDE_STATE=""
 sync_claude_creds() {
-  local secrets="$DIR/.secrets" file
+  local secrets="$DIR/.secrets" file tmp
   file="$secrets/.credentials.json"
   mkdir -p "$secrets"; chmod 700 "$secrets"
+  # Write to a temp file first. `security ... > "$file"` truncated the target
+  # BEFORE security ran, so a denied Keychain prompt (or a locked keychain)
+  # destroyed a perfectly good cached token and left you logged out inside.
+  tmp="$(mktemp "$secrets/.creds.XXXXXX")"
   if security find-generic-password -s "Claude Code-credentials" -w \
-       > "$file" 2>/dev/null && [ -s "$file" ]; then
-    chmod 600 "$file"
+       > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv "$tmp" "$file"; chmod 600 "$file"
     CLAUDE_STATE="${G}logged in${N} ${DIM}(synced from your Keychain)${N}"
   else
-    : > "$file"
-    CLAUDE_STATE="${Y}not logged in${N} ${DIM}(run /login inside, or set ANTHROPIC_API_KEY)${N}"
+    rm -f "$tmp"
+    [ -f "$file" ] || : > "$file"
+    chmod 600 "$file" 2>/dev/null || true
+    if [ -s "$file" ]; then
+      CLAUDE_STATE="${Y}cached login${N} ${DIM}(Keychain unavailable — kept last known token)${N}"
+    else
+      CLAUDE_STATE="${Y}not logged in${N} ${DIM}(run /login inside, or set ANTHROPIC_API_KEY)${N}"
+    fi
   fi
 }
 
+# Claude login for the sandbox. Preferred: the long-lived token stored by
+# `airlock login` — nothing refreshes it, so the Mac and every sandbox stop
+# invalidating each other's login. Fallback: the Keychain OAuth copy above.
+TOKEN_SERVICE="airlock-claude-oauth-token"
+load_claude_login() {
+  local tok
+  if tok="$(security find-generic-password -s "$TOKEN_SERVICE" -w 2>/dev/null)" && [ -n "$tok" ]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$tok"
+    # compose still mounts this path; it must stay a file, never a Docker-made dir
+    mkdir -p "$DIR/.secrets"; chmod 700 "$DIR/.secrets"
+    [ -f "$DIR/.secrets/.credentials.json" ] || { : > "$DIR/.secrets/.credentials.json"; chmod 600 "$DIR/.secrets/.credentials.json"; }
+    CLAUDE_STATE="${G}logged in${N} ${DIM}(long-lived token from 'airlock login')${N}"
+  else
+    sync_claude_creds
+    CLAUDE_STATE="${CLAUDE_STATE} ${DIM}· 'airlock login' stops \"Login expired\"${N}"
+  fi
+}
+
+# Stage the host's global CLAUDE.md so every sandbox inherits your standing
+# instructions. COPIED into .secrets/ rather than bind-mounting ~/.claude/CLAUDE.md
+# directly, for two reasons:
+#   1. If the host file were ever absent, Docker would create a DIRECTORY at
+#      ~/.claude/CLAUDE.md — which breaks Claude Code on your Mac, not just here.
+#   2. A file bind-mount nested inside the /home/node volume makes Docker
+#      auto-create /home/node/.claude as root; the uid-1000 entrypoint then
+#      can't write credentials into it, and there is no sudo in the image.
+# Set AIRLOCK_CLAUDE_MD to another path to override, or to "" to skip entirely.
+CLAUDE_MD_STATE=""
+# Follow symlinks: ~/.claude/CLAUDE.md is often a link into a rules repo.
+real_path() {
+  realpath "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+}
+
+# dev: mount the real global CLAUDE.md read-write (see entrypoint.sh).
+link_claude_md_dev() {
+  local src real lines
+  src="${AIRLOCK_CLAUDE_MD-$HOME/.claude/CLAUDE.md}"
+  real=""
+  [ -n "$src" ] && [ -e "$src" ] && real="$(real_path "$src" || true)"
+  if [ -n "$real" ] && [ -f "$real" ]; then
+    export AIRLOCK_CLAUDE_MD_FILE="$real"
+    lines="$(wc -l < "$real" | tr -d ' ')"
+    CLAUDE_MD_STATE="${G}same file as your Mac${N} ${DIM}(${real/#$HOME/~}, ${lines} lines, read-write)${N}"
+  else
+    # Never let Docker invent a directory at a missing path: mount an empty stub.
+    sync_claude_md
+    export AIRLOCK_CLAUDE_MD_FILE="$DIR/.secrets/CLAUDE.md"
+  fi
+}
+
+sync_claude_md() {
+  local src dst
+  src="${AIRLOCK_CLAUDE_MD-$HOME/.claude/CLAUDE.md}"
+  dst="$DIR/.secrets/CLAUDE.md"
+  mkdir -p "$DIR/.secrets"; chmod 700 "$DIR/.secrets"
+  if [ -z "$src" ]; then
+    : > "$dst"; chmod 600 "$dst"
+    CLAUDE_MD_STATE="${DIM}skipped (AIRLOCK_CLAUDE_MD is empty)${N}"
+  elif [ -f "$src" ]; then
+    cp -L "$src" "$dst"; chmod 600 "$dst"   # -L: copy what a symlink points to
+    CLAUDE_MD_STATE="${G}same as your Mac${N} ${DIM}(fresh copy, $(wc -l < "$dst" | tr -d ' ') lines, read-only inside)${N}"
+  else
+    : > "$dst"; chmod 600 "$dst"
+    CLAUDE_MD_STATE="${Y}not found${N} ${DIM}(${src})${N}"
+  fi
+}
+
+# Claude files sessions under ~/.claude/projects/<path with every
+# non-alphanumeric char turned into "-">, e.g. /Users/me/Code/app ->
+# -Users-me-Code-app. run mounts the project at its Mac path, so the key
+# inside the sandbox is the same one your Mac's Claude uses.
+claude_project_key() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+
+# run mode: give the sandbox THIS project's session folder from the Mac.
+# AIRLOCK_RUN_HISTORY=0 keeps sessions in the client volume instead.
+SESSIONS_STATE=""
+prepare_run_sessions() {
+  local key dir n
+  if [ "${AIRLOCK_RUN_HISTORY:-1}" != 1 ]; then
+    mkdir -p "$STATE_DIR/no-sessions/memory"
+    export AIRLOCK_SESSIONS_DIR="$STATE_DIR/no-sessions"
+    unset AIRLOCK_SESSION_KEY
+    SESSIONS_STATE="${DIM}kept in the client volume (AIRLOCK_RUN_HISTORY=0)${N}"
+    return 0
+  fi
+  key="$(claude_project_key "$WORKSPACE")"
+  dir="$HOME/.claude/projects/$key"
+  # Create it here, as you: if Docker had to, it would be root-owned.
+  mkdir -p "$dir/memory"
+  export AIRLOCK_SESSION_KEY="$key" AIRLOCK_SESSIONS_DIR="$dir"
+  n="$(find "$dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')"
+  SESSIONS_STATE="${G}saved on your Mac${N} ${DIM}· ~/.claude/projects/${key} · ${n} so far · claude --resume${N}"
+}
+
 # Polished launch banner. Adapts to terminal: colored on a TTY, plain when piped.
-# $1 = mode (run|dev)
+# $1 = mode (run|dev|sbx)
 launch_banner() {
-  local mode="$1" wl
+  local mode="$1" wl vmode
   wl="$(readable_whitelist | wc -l | tr -d ' ')"
+  if [ "$mode" = dev ]; then vmode="dev"; else vmode="untrusted"; fi
   echo ""
   hr
   if [ "$mode" = run ]; then
@@ -105,6 +365,7 @@ launch_banner() {
   fi
   hr
   echo "  ${B}path${N}      ${C}${WORKSPACE}${N}"
+  echo "  ${B}client${N}    ${C}${AIRLOCK_CLIENT}${N} ${DIM}· home volume $(home_volume_name "$vmode")${N}"
   if [ "$mode" = sbx ]; then
     echo "            ${DIM}↳ mounted in the microVM — the only host folder it can see${N}"
     echo "  ${B}isolation${N} ${C}microVM${N} ${DIM}· own Linux kernel — a container escape can't reach your Mac${N}"
@@ -112,79 +373,405 @@ launch_banner() {
     echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· project dir only${N}"
     echo "  ${B}ports${N}     ${DIM}publish with: docker sandbox network proxy / ports${N}"
   else
-    echo "            ${DIM}↳ mounted at /workspace — the only host folder the box can see${N}"
     if [ "$mode" = run ]; then
+      echo "            ${DIM}↳ mounted at the same path — the only project folder the box can see${N}"
       echo "  ${B}network${N}   ${G}whitelist only${N} ${DIM}· ${wl} domains allowed, everything else blocked${N}"
-      echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· Claude token only, no history${N}"
+      echo "  ${B}secrets${N}   ${G}none of your files${N} ${DIM}· Claude token only${N}"
+      echo "  ${B}sessions${N}  ${SESSIONS_STATE}"
     else
+      echo "            ${DIM}↳ mounted at the same path inside, so Claude history matches your Mac${N}"
       echo "  ${B}network${N}   ${Y}full internet${N}"
-      echo "  ${B}secrets${N}   ${Y}Claude login + history${N} ${DIM}· trusted mode${N}"
+      echo "  ${B}secrets${N}   ${Y}Claude token${N} ${DIM}· trusted mode${N}"
+      echo "  ${B}history${N}   ${Y}your Mac's ~/.claude${N} ${DIM}· sessions + memory read-write, kept after exit${N}"
     fi
-    echo "  ${B}ports${N}     ${DIM}3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac${N}"
+    if [ "$HOME_MODE" = ephemeral ]; then
+      echo "  ${B}home${N}      ${Y}ephemeral${N} ${DIM}· tmpfs — logins & caches destroyed on exit${N}"
+    else
+      echo "  ${B}home${N}      ${G}persistent${N} ${DIM}· per-client volume — caches & logins survive${N}"
+    fi
+    echo "  ${B}ports${N}     ${G}1:1${N} ${DIM}$(compact_ports "$PORTS_ONE") — same URL inside and on your Mac${N}"
+    if [ -n "$PORTS_MOVED" ]; then
+      echo "            ${Y}↳ taken on your Mac, moved:${PORTS_MOVED} — open the new port, not the one your dev server prints${N}"
+    fi
+    echo "            ${DIM}↳ e.g. http://localhost:${PORTS_FIRST:-3000} · no --host needed, localhost servers are forwarded${N}"
+  fi
+  if [ "$mode" = run ] && [ "${AIRLOCK_NOTIFY:-1}" = 1 ]; then
+    echo "  ${B}blocked${N}   ${DIM}you get a macOS notification when a site is blocked · fix: airlock allow${N}"
+  fi
+  [ -n "$UPDATE_STATE" ] && echo "  ${B}tools${N}     ${UPDATE_STATE}"
+  if [ -s "$STATE_DIR/disk-warning" ]; then
+    echo "  ${B}disk${N}      ${R}$(cat "$STATE_DIR/disk-warning")${N}"
   fi
   echo "  ${B}claude${N}    ${CLAUDE_STATE}"
+  echo "  ${B}CLAUDE.md${N} ${CLAUDE_MD_STATE}"
   hr
   if [ "$mode" = sbx ]; then
     echo "  ${DIM}'exit' leaves — the microVM is KEPT (reused next spin) · new: airlock sbx --fresh · destroy: airlock sbx down${N}"
+  elif [ "$HOME_MODE" = ephemeral ]; then
+    echo "  ${DIM}type 'exit' to leave — container AND home are destroyed (nothing persists)${N}"
   else
-    echo "  ${DIM}type 'exit' to leave — the container is destroyed (fresh next spin)${N}"
+    echo "  ${DIM}type 'exit' to leave — container is destroyed; this client's home volume is kept${N}"
   fi
   echo ""
 }
 
-# Find the running sandbox container (untrusted or dev), excluding the proxy.
+# Find the running sandbox for THIS project (untrusted or dev), not the proxy.
 running_sandbox() {
   docker ps --format '{{.ID}} {{.Names}}' \
-    | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' | head -1
+    | grep -E " ${COMPOSE_PROJECT_NAME}-(untrusted|dev)-run" | awk '{print $1}' | head -1
 }
+
+# This project's proxy container id, if it's up.
+proxy_cid() { dc --profile run ps -q proxy 2>/dev/null | head -1; }
 
 # Proxy log: live container if running, else the saved last-session log.
 proxy_log() {
-  if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then
-    docker logs airlock-proxy 2>&1
-  elif [ -f "$DIR/.logs/proxy-last.log" ]; then
-    cat "$DIR/.logs/proxy-last.log"
+  local cid; cid="$(proxy_cid || true)"
+  if [ -n "${cid:-}" ]; then
+    docker logs "$cid" 2>&1
+  elif [ -f "$DIR/.logs/${COMPOSE_PROJECT_NAME}-proxy-last.log" ]; then
+    cat "$DIR/.logs/${COMPOSE_PROJECT_NAME}-proxy-last.log"
   fi
 }
 
-# Tear down the proxy + networks, but ONLY if no other sandbox is still running
-# (so a 2nd `airlock exec`/`run` terminal doesn't lose its network).
-teardown_proxy_if_idle() {
-  if docker ps --format '{{.Names}}' | grep -qE 'airlock-(untrusted|dev)-run'; then
+# Tear down this project's proxy + networks, but ONLY if no other sandbox for
+# this project is still running (so a 2nd terminal doesn't lose its network).
+# Runs for dev too: dev used to leave its network behind for every project.
+teardown_if_idle() {
+  if docker ps --format '{{.Names}}' | grep -qE "^${COMPOSE_PROJECT_NAME}-(untrusted|dev)-run"; then
     return 0   # another sandbox is live — leave the proxy up for it
   fi
   # Persist the proxy log so `airlock blocked` still works after teardown.
-  if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then
+  local cid; cid="$(proxy_cid || true)"
+  if [ -n "${cid:-}" ]; then
     mkdir -p "$DIR/.logs"
-    docker logs airlock-proxy > "$DIR/.logs/proxy-last.log" 2>&1 || true
+    docker logs "$cid" > "$DIR/.logs/${COMPOSE_PROJECT_NAME}-proxy-last.log" 2>&1 || true
   fi
-  echo "${DIM}› tearing down proxy + isolated network…${N}"
-  dc --profile run down --remove-orphans >/dev/null 2>&1 || true
+  echo "${DIM}› tearing down this project's network (and proxy)…${N}"
+  dc --profile run --profile dev down --remove-orphans >/dev/null 2>&1 || true
 }
 
-# ---- sbx (Docker microVM) integration -------------------------------------
-# `airlock sbx` runs the project inside a Docker Sandbox: a microVM with its
-# OWN kernel (hardware-enforced isolation, so a container escape can't reach the
-# host), and we apply airlock's SAME egress whitelist via the sandbox's proxy.
-# Escape-proof + exfil-proof. Requires `docker sandbox` (Docker Desktop 4.58+).
+# The sandbox container gets a known name so it can be removed on the way
+# out. Closing the terminal tab (SIGHUP) used to leave it running: it kept
+# its RAM, its ports (so the next project's `airlock dev` failed), and kept
+# Docker's VM from ever idling.
+SANDBOX_NAME=""
+on_sandbox_exit() {
+  stop_block_notifier
+  if [ -n "$SANDBOX_NAME" ]; then
+    docker rm -f "$SANDBOX_NAME" >/dev/null 2>&1 || true
+  fi
+  print_session_blocked || true
+  teardown_if_idle
+}
+# $1 = untrusted|dev
+arm_cleanup() {
+  SANDBOX_NAME="${COMPOSE_PROJECT_NAME}-$1-run-$$"
+  trap on_sandbox_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 143' TERM
+}
 
-# Image used as the microVM template so airlock's tooling (node/pnpm/deploy CLIs)
-# is present inside. Override with AIRLOCK_SBX_TEMPLATE= to use sbx's default,
-# or AIRLOCK_SBX_TEMPLATE=some/image to use another.
+# Starting the same mode twice in one project used to spin up a second 4g box
+# fighting for the same ports. Attach to the live one instead.
+# $1 = untrusted|dev, rest = command
+attach_if_running() {
+  local svc="$1" cid; shift
+  cid="$(docker ps --format '{{.ID}} {{.Names}}' \
+    | grep -E " ${COMPOSE_PROJECT_NAME}-${svc}-run" | awk '{print $1}' | head -1 || true)"
+  [ -n "$cid" ] || return 0
+  echo "› this project's ${svc} sandbox is already running — attaching to it (same as airlock exec)"
+  if [ "$#" -eq 0 ]; then exec docker exec -it "$cid" "${SHELL_CMD[@]}"; else exec docker exec -it "$cid" "$@"; fi
+}
+
+# Every airlock compose project on this machine — including ones that only
+# left a network behind — torn down.
+down_all() {
+  echo "› stopping EVERY airlock project…"
+  { docker ps -a --format '{{.Label "com.docker.compose.project"}}'
+    docker network ls --format '{{.Label "com.docker.compose.project"}}'; } 2>/dev/null \
+    | grep '^airlock-' | sort -u | while read -r p; do
+      docker compose -p "$p" "${COMPOSE_FILES[@]}" --profile run --profile dev \
+        down --remove-orphans >/dev/null 2>&1 || true
+    done || true   # grep finding nothing must not trip set -e/pipefail
+  docker ps -aq --filter "name=^airlock-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+}
+
+# Strip leading flags shared by run/dev. Sets HOME_MODE and WIPE_HOME.
+WIPE_HOME=0
+parse_mode_flags() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --ephemeral|--throwaway) set_home_mode ephemeral; shift ;;
+      --fresh)                 WIPE_HOME=1; shift ;;
+      *) break ;;
+    esac
+  done
+  PARSED_ARGS=("$@")
+}
+
+# ---- disk hygiene ------------------------------------------------------------
+# Why Docker "ran out of space" after a few days across several projects:
+#   * every client x mode has a home volume, and npm/pnpm/yarn caches inside
+#     it only ever grow (pnpm can't hard-link across the bind mount, so its
+#     store is a full extra copy of every package you ever installed);
+#   * every `airlock build` left the previous image behind as a dangling
+#     ~2 GB layer set, plus BuildKit cache, and nothing ever pruned them;
+#   * volumes of clients you stopped working on were kept forever;
+#   * container logs were unbounded (now capped in docker-compose.yml).
+# `airlock clean` fixes all of that, and runs itself (light mode) at most
+# once a day in the background on launch.
+
+CACHE_LIMIT_GB="${AIRLOCK_CACHE_LIMIT_GB:-3}"   # per home volume, before auto-trim
+STALE_DAYS="${AIRLOCK_STALE_DAYS:-30}"          # a volume unused this long is "stale"
+DISK_WARN_PCT="${AIRLOCK_DISK_WARN_PCT:-75}"
+
+mark_volume_used() {  # $1 = volume name
+  mkdir -p "$STATE_DIR/used"; : > "$STATE_DIR/used/$1"
+}
+# Days since a volume was last launched; empty if never tracked.
+volume_idle_days() {
+  local f="$STATE_DIR/used/$1"
+  [ -f "$f" ] || return 0
+  echo $(( ( $(date +%s) - $(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f") ) / 86400 ))
+}
+volume_in_use() { [ -n "$(docker ps -q --filter "volume=$1" 2>/dev/null)" ]; }
+
+# Docker Desktop's whole VM disk. Docker.raw is a sparse file: its apparent
+# size is the configured limit, its allocated size is what's really used.
+vm_disk_pct() {
+  local raw="$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" used lim
+  [ -f "$raw" ] || return 0
+  used=$(du -k "$raw" | cut -f1)
+  lim=$(( $(stat -f %z "$raw") / 1024 ))
+  [ "$lim" -gt 0 ] && echo $(( used * 100 / lim ))
+}
+human_kb() { awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k/1048576; else printf "%d MB", k/1024 }'; }
+
+# Runs inside a throwaway, network-less container with one home volume
+# mounted. Prints "cache_kb_before cache_kb_after home_kb". Only package
+# manager caches are touched — logins, nvm versions and Claude history stay.
+TRIM_SH='
+caches="$HOME/.npm/_cacache $HOME/.npm/_npx $HOME/.local/share/pnpm/store $HOME/.cache/pnpm $HOME/.cache/yarn $HOME/.yarn/berry/cache $HOME/.bun/install/cache $HOME/.cache/node-gyp"
+cache_kb() { du -sk $caches 2>/dev/null | awk "{s+=\$1} END {print s+0}"; }
+before=$(cache_kb)
+if [ "$before" -ge "$LIMIT_KB" ]; then rm -rf $caches; fi
+echo "$before $(cache_kb) $(du -sk "$HOME" 2>/dev/null | cut -f1)"
+'
+# $1 = volume, $2 = limit in KB (0 = always trim)
+trim_volume() {
+  docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+    --user 1000:1000 -e HOME=/home/node -e LIMIT_KB="$2" \
+    -v "$1:/home/node" --entrypoint sh "$SANDBOX_IMAGE" -c "$TRIM_SH" 2>/dev/null
+}
+
+# $1 = --auto (light, background, never deletes volumes)
+#      --stale (also delete home volumes unused for STALE_DAYS)
+#      --deep  (also drop ALL build cache; next build is slow)
+#      ""      (normal: trim every idle volume's caches)
+airlock_clean() {
+  local how="${1:-}" v kb before after home freed=0 stale_list="" stale_kb=0 idle pct
+  local quiet=0; [ "$how" = --auto ] && quiet=1
+  say() { [ "$quiet" = 1 ] || echo "$@"; }
+
+  # Leftovers from closed laptops / crashed terminals (the exit trap never
+  # ran). Networks cost no disk, but Docker only has ~30 address pools: enough
+  # orphans and every new project fails with "could not find an available,
+  # non-overlapping IPv4 address pool".
+  # --auto runs while a sandbox is starting, so it skips that project and
+  # never touches "created" containers (that's what a starting one is).
+  local skip="${AIRLOCK_SKIP_PROJECT:-^$}" states="--filter status=exited --filter status=dead"
+  [ "$quiet" = 1 ] || states="$states --filter status=created"
+  say "› removing leftover airlock containers and networks…"
+  # shellcheck disable=SC2086
+  docker ps -a $states --format '{{.ID}} {{.Names}}' --filter "name=^airlock-" 2>/dev/null \
+    | grep -vE " ${skip}-" | awk '{print $1}' | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker network ls --format '{{.Name}}' 2>/dev/null | grep '^airlock-' | grep -vE "^${skip}_" \
+    | xargs -r -n1 docker network rm >/dev/null 2>&1 || true   # in-use ones refuse; fine
+
+  say "› removing dangling images (old builds) and build cache…"
+  docker image prune -f >/dev/null 2>&1 || true
+  if [ "$how" = --deep ]; then
+    docker builder prune -af >/dev/null 2>&1 || true
+  else
+    docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
+  fi
+
+  if image_exists "$SANDBOX_IMAGE"; then
+    say "› trimming package caches in home volumes…"
+    for v in $(docker volume ls -q 2>/dev/null | grep '^airlock-home-' || true); do
+      if volume_in_use "$v"; then say "    ${DIM}skip $v (in use)${N}"; continue; fi
+      # never tracked (older airlock) -> start tracking from today
+      [ -f "$STATE_DIR/used/$v" ] || mark_volume_used "$v"
+      idle="$(volume_idle_days "$v")"
+      # auto mode runs while a sandbox may be starting: leave fresh ones alone
+      if [ "$quiet" = 1 ] && [ -n "$(find "$STATE_DIR/used/$v" -mmin -30 2>/dev/null)" ]; then continue; fi
+      if [ "$how" = --stale ] && [ "${idle:-0}" -ge "$STALE_DAYS" ]; then
+        docker volume rm "$v" >/dev/null 2>&1 && { rm -f "$STATE_DIR/used/$v"; say "    ${Y}removed${N} $v ${DIM}(unused ${idle} days)${N}"; }
+        continue
+      fi
+      if [ "$quiet" = 1 ]; then kb=$(( CACHE_LIMIT_GB * 1048576 )); else kb=0; fi
+      read -r before after home <<<"$(trim_volume "$v" "$kb" || echo "0 0 0")"
+      freed=$(( freed + ${before:-0} - ${after:-0} ))
+      [ "${before:-0}" -gt "${after:-0}" ] && say "    $v  ${G}-$(human_kb $(( before - after )))${N} ${DIM}(now $(human_kb "${home:-0}"))${N}"
+      if [ "${idle:-0}" -ge "$STALE_DAYS" ]; then
+        stale_list="$stale_list $v"; stale_kb=$(( stale_kb + ${home:-0} ))
+      fi
+    done
+  fi
+  say "› freed about $(human_kb "$freed") of package caches"
+
+  # Banner warning for the next launch (empty file = all good).
+  mkdir -p "$STATE_DIR"; : > "$STATE_DIR/disk-warning"
+  pct="$(vm_disk_pct || true)"
+  if [ -n "$pct" ] && [ "$pct" -ge "$DISK_WARN_PCT" ]; then
+    echo "Docker disk ${pct}% full — run: airlock clean --stale (or --deep)" > "$STATE_DIR/disk-warning"
+  elif [ -n "$stale_list" ]; then
+    echo "$(echo $stale_list | wc -w | tr -d ' ') client volume(s) unused >${STALE_DAYS}d hold $(human_kb "$stale_kb") — airlock clean --stale" > "$STATE_DIR/disk-warning"
+  fi
+  [ -n "$stale_list" ] && [ "$how" != --stale ] && say "› unused >${STALE_DAYS} days:${stale_list} — delete with: airlock clean --stale"
+  [ -n "$pct" ] && say "› Docker disk is ${pct}% full"
+  date +%s > "$STATE_DIR/last-clean"
+}
+
+# Once a day, on launch, in the background — so nobody has to remember.
+maybe_auto_clean() {
+  [ "${AIRLOCK_AUTO_CLEAN:-1}" = 1 ] || return 0
+  local last=0
+  [ -f "$STATE_DIR/last-clean" ] && last="$(cat "$STATE_DIR/last-clean" 2>/dev/null || echo 0)"
+  [ $(( $(date +%s) - ${last:-0} )) -ge 86400 ] || return 0
+  mkdir -p "$STATE_DIR" "$DIR/.logs"
+  date +%s > "$STATE_DIR/last-clean"   # claim the slot before forking
+  AIRLOCK_SKIP_PROJECT="$COMPOSE_PROJECT_NAME" \
+    nohup "$DIR/airlock" clean --auto > "$DIR/.logs/clean-last.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+
+# ---- keeping the tools current -------------------------------------------------
+# The image installs the latest of everything, but Docker's layer cache froze
+# it at the first build. `airlock update` rebuilds with --pull and a new
+# AIRLOCK_REFRESH (see Dockerfile); this runs it in the background every
+# AIRLOCK_UPDATE_DAYS so the sandbox is never more than a few days behind.
+UPDATE_DAYS="${AIRLOCK_UPDATE_DAYS:-3}"
+days_since() {  # $1 = file holding an epoch; empty if missing
+  [ -s "$1" ] || return 0
+  echo $(( ( $(date +%s) - $(cat "$1" 2>/dev/null || echo 0) ) / 86400 ))
+}
+UPDATE_STATE=""
+maybe_auto_update() {
+  local age tried
+  [ "${AIRLOCK_AUTO_UPDATE:-1}" = 1 ] || return 0
+  [ -d "$STATE_DIR/update.lock" ] && { UPDATE_STATE="${DIM}updating in the background — next launch gets it${N}"; return 0; }
+  age="$(days_since "$STATE_DIR/last-update")"
+  [ -n "$age" ] && [ "$age" -lt "$UPDATE_DAYS" ] && return 0
+  # Offline or failing: retry at most every 6 hours, not on every launch.
+  tried="$(find "$STATE_DIR/last-update-try" -mmin -360 2>/dev/null || true)"
+  [ -z "$tried" ] || return 0
+  mkdir -p "$STATE_DIR" "$DIR/.logs"; : > "$STATE_DIR/last-update-try"
+  nohup "$DIR/airlock" update --auto > "$DIR/.logs/update-last.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  UPDATE_STATE="${DIM}updating Node/Claude/CLIs to latest in the background — next launch gets it${N}"
+}
+image_versions() {
+  docker run --rm --network none --entrypoint cat "$SANDBOX_IMAGE" /opt/airlock-versions.txt 2>/dev/null || true
+}
+
+# ---- blocked-site feedback ----------------------------------------------------
+# "The website doesn't load" in run mode was almost always the whitelist, but
+# nothing said so. Now: a macOS notification the first time each host is
+# blocked, and a summary with the exact `airlock allow` line on exit.
+blocked_hosts() {  # stdin: proxy log -> unique blocked hosts, minus ones allowed since
+  sed -nE 's/.*refused on filtered domain "([^"]+)".*/\1/p' | tr -cd 'A-Za-z0-9.\n-' | sort -u \
+    | grep -viEf <(grep -vE '^[[:space:]]*(#|$)' "$FILTER") || true
+}
+SESSION_START=""
+NOTIFIER_PID=""
+start_block_notifier() {
+  SESSION_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  [ "${AIRLOCK_NOTIFY:-1}" = 1 ] && command -v osascript >/dev/null 2>&1 || return 0
+  local seen; seen="$(mktemp)"
+  (
+    set +e +o pipefail   # a dropped log stream must not kill the watcher
+    since="$SESSION_START"
+    while :; do
+      cid="$(proxy_cid 2>/dev/null || true)"
+      if [ -n "$cid" ]; then
+        docker logs -f --since "$since" "$cid" 2>&1 | while IFS= read -r line; do
+          host="$(printf '%s\n' "$line" | blocked_hosts)"
+          [ -n "$host" ] && ! grep -qxF "$host" "$seen" || continue
+          echo "$host" >> "$seen"
+          osascript -e "display notification \"Run on your Mac: airlock allow $host\" with title \"airlock blocked $host\" subtitle \"Not on the whitelist (${COMPOSE_PROJECT_NAME#airlock-})\"" >/dev/null 2>&1 || true
+        done
+        since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # proxy restarted (airlock allow)
+      fi
+      sleep 2
+    done
+  ) >/dev/null 2>&1 &
+  NOTIFIER_PID=$!
+}
+stop_block_notifier() {
+  [ -n "$NOTIFIER_PID" ] || return 0
+  local kids; kids="$(pgrep -P "$NOTIFIER_PID" 2>/dev/null || true)"
+  kill "$NOTIFIER_PID" 2>/dev/null || true
+  [ -n "$kids" ] && kill $kids 2>/dev/null || true
+  NOTIFIER_PID=""
+}
+print_session_blocked() {
+  [ -n "$SESSION_START" ] || return 0
+  local cid hosts; cid="$(proxy_cid || true)"
+  [ -n "${cid:-}" ] || return 0
+  hosts="$(docker logs --since "$SESSION_START" "$cid" 2>&1 | blocked_hosts)"
+  [ -n "$hosts" ] || return 0
+  echo ""
+  echo "  ${Y}⚠ the whitelist blocked these sites this session:${N}"
+  printf '%s\n' "$hosts" | sed "s/^/    ${R}✗${N} /"
+  echo "  ${DIM}allow the ones you trust:${N} airlock allow   ${DIM}(pick from a list)${N}"
+}
+
+# "https://API.Sanity.io:443/v1/x" -> "api.sanity.io". The proxy matches the
+# HOST only, so a port/scheme/path in a rule silently never matched.
+normalize_domain() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's#^[a-z]+://##; s#[/?#].*$##; s#:[0-9]+$##; s#^\*\.##; s#\.$##'
+}
+allow_domain() {
+  local dom esc
+  dom="$(normalize_domain "$1")"
+  if ! printf '%s' "$dom" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+    echo "${R}✗ '$1' isn't a domain${N} ${DIM}(e.g. api.example.com)${N}"; return 1
+  fi
+  esc="$(printf '%s' "$dom" | sed 's/\./\\./g')"
+  # Two rules, not one. A lone '\.example\.com$' matches www.example.com but
+  # NOT example.com itself — the bare-domain anchor is required as well.
+  if grep -qxF "^${esc}\$" "$FILTER" 2>/dev/null; then
+    echo "› '$dom' is already on the whitelist"
+  else
+    printf '^%s$\n' "$esc" >> "$FILTER"
+    printf '\\.%s$\n' "$esc" >> "$FILTER"
+    echo "› added ${C}${dom}${N} and ${C}*.${dom}${N} to the whitelist"
+  fi
+}
+
+# ---- habit guard (host shell) -------------------------------------------------
+GUARD_RCS=("$HOME/.zshrc" "$HOME/.bashrc")
+guard_line() { printf 'AIRLOCK_BIN="%s/airlock"; [ -f "%s/shell/guard.sh" ] && . "%s/shell/guard.sh"  # airlock guard\n' "$DIR" "$DIR" "$DIR"; }
+
+# ---- sbx (Docker microVM) integration -------------------------------------
+# NOTE: `docker sandbox` has been REMOVED from current Docker Desktop. This
+# path exits with guidance rather than failing obscurely.
 SBX_TEMPLATE="${AIRLOCK_SBX_TEMPLATE-$SANDBOX_IMAGE}"
 
 dsbx() { docker sandbox "$@"; }
 
 sbx_require() {
   if ! docker sandbox version >/dev/null 2>&1; then
-    echo "${R}✗ 'docker sandbox' not available.${N}"
-    echo "  airlock sbx needs Docker Sandboxes (Docker Desktop 4.58+ or the sbx CLI)."
-    echo "  Update Docker Desktop, or use ${G}airlock run${N} (container mode) instead."
+    echo "${R}✗ 'docker sandbox' is not available on this Docker.${N}"
+    echo "  It was removed from Docker Desktop (see: Docker Sandboxes)."
+    echo "  Use ${G}airlock run${N} (container mode) instead."
     exit 1
   fi
 }
 
-# Stable per-project sandbox name (sbx allows [A-Za-z0-9._+-]).
 sbx_name() {
   local base hash
   base="$(basename "$WORKSPACE" | tr -cs 'A-Za-z0-9._+-' '-' | sed 's/-*$//')"
@@ -194,8 +781,6 @@ sbx_name() {
 
 sbx_exists() { docker sandbox ls 2>/dev/null | grep -qw "$1"; }
 
-# Translate airlock's regex whitelist into `--allow-host` flags for the sbx
-# proxy. *.foo.com -> foo.com (sbx matches the domain + its subdomains).
 sbx_apply_whitelist() {
   local name="$1" d; local -a allow=()
   while IFS= read -r d; do
@@ -212,44 +797,77 @@ print_help() {
     airlock <command> [args]
 
   ${B}ENTER A SANDBOX${N}
-    ${G}run${N} [cmd]        🔒 untrusted code — no history, whitelist-only network
-    ${Y}dev${N} [cmd]        ⚠  your own code — Claude login + full internet
-    ${C}sbx${N} [cmd]        🧊 strongest — Docker microVM (own kernel) + whitelist
-                     ${DIM}kept & reused by default · 'airlock sbx --fresh' new · 'airlock sbx down' destroy${N}
+    ${G}run${N} [cmd]        🔒 untrusted code — whitelist-only network, sessions saved per project on your Mac
+    ${Y}dev${N} [cmd]        ⚠  your own code — Claude login + full internet + your Mac's Claude history
     exec [cmd]       open another terminal into the running sandbox
 
+    ${B}flags${N} ${DIM}(run / dev)${N}
+      --ephemeral    tmpfs home — logins & caches destroyed on exit.
+                     ${DIM}use this for deploy sessions (vercel/heroku/netlify login)${N}
+      --fresh        wipe this client's home volume first, then start clean
+
+  ${B}MULTI-CLIENT${N}
+    Each ${B}project${N} gets its own proxy and isolated network.
+    Each ${B}client${N} gets its own /home/node volume — caches and Claude history
+    persist per client and never leak across them.
+    Client is resolved from: ${C}\$AIRLOCK_CLIENT${N} → ${C}.airlock-client${N} file → parent dir name.
+
+    reset [client]   wipe a client's home volume (default: this project's client)
+
+  ${B}CLAUDE LOGIN${N}
+    login            store a long-lived Claude token — fixes "Login expired"
+    logout           remove it (sandboxes fall back to your Keychain login)
+
   ${B}NETWORK${N}
-    allow <domain>   permit a domain in 'run' mode, then run: airlock rebuild
+    allow [domain…]  permit domains in 'run' mode — no args: pick from what was blocked
     blocked          list the URLs/hosts the proxy denied (not whitelisted)
     logs             watch what the proxy allows / blocks (live)
+                     ${DIM}a macOS notification pops up whenever a site is blocked (AIRLOCK_NOTIFY=0 to mute)${N}
 
-  ${B}LIFECYCLE${N}  ${DIM}(fresh start / destroy — works for every mode)${N}
-    run / dev        throwaway: each spin is a fresh container (--rm), destroyed on exit
-    sbx              kept & reused so login/installs persist; ${DIM}airlock sbx --fresh${N} = new box
-    sbx down         destroy just this project's microVM
-    down             stop & remove EVERYTHING — run/dev containers, proxy, all sbx microVMs
+  ${B}PORTS${N}  ${DIM}(published automatically — nothing to configure)${N}
+    $(compact_ports "$DEFAULT_PORTS")
+                     Next/CRA/Remix 3000-3005 · Angular 4200 · Vite 5173-5175 / 4173
+                     Astro 4321 · Storybook 6006 · Django/FastAPI 8000 · Expo 8081
+                     wrangler 8787 · Flask/.NET 5000-5001 · misc 4000 8080 9000
+                     1:1 when free; a busy one moves to 1<port> (3000→13000)
+    ${DIM}more: .airlock-ports file in the project, or AIRLOCK_EXTRA_PORTS="7000 7001"${N}
+
+  ${B}HABIT GUARD${N}
+    guard on|off     on your Mac, npm/pnpm/yarn/npx/bun/node inside a project ask
+                     to run in airlock instead (scripts & editors are unaffected)
+    guard            show whether it's on, and which projects you trusted
+
+  ${B}DISK${N}
+    disk             what's using Docker's disk, per client volume
+    clean            remove leftovers, old builds, package caches (runs daily by itself)
+    clean --stale    …and delete client volumes unused for ${STALE_DAYS} days
+    clean --deep     …and ALL build cache
 
   ${B}MANAGE${N}
     status           what's running, and whether it's safe
-    down             stop & remove the sandboxes (run/dev/sbx) + proxy
+    down             stop & remove THIS project's sandbox + proxy
+    down --all       stop & remove every airlock project on this machine
+    off              down --all, then quit Docker Desktop — gives its RAM back
     build            build images
     rebuild          build images from scratch (no cache)
+    update           latest Node LTS, Claude Code, npm/pnpm and deploy CLIs
+                     ${DIM}(also runs by itself in the background every ${UPDATE_DAYS} days)${N}
 
   ${B}INFO${N}
-    help             this help   (also: --help, -h)
+    help             this help   (also: airlock, --help, -h)
 
   ${B}EXAMPLES${N}  ${DIM}(by use case)${N}
-    ${DIM}cd ~/some/oss && airlock run${N}        untrusted OSS — safe, light, throwaway
-    ${DIM}cd ~/CodeBase/app && airlock dev${N}    your own code — full internet, your tools
-    ${DIM}cd ~/malware && airlock sbx${N}         hostile code / agents — microVM, escape-proof
-    ${DIM}airlock run npm test${N}                one-off command in a fresh box
-    ${DIM}airlock sbx npm test${N}                one-off command in the kept microVM
-    ${DIM}airlock sbx --fresh${N}                 wipe & rebuild this project's microVM
-    ${DIM}airlock sbx down${N}                    destroy this project's microVM
-    ${DIM}airlock allow files.example.com${N}     widen the whitelist (run/sbx)
+    ${DIM}cd ~/Codebases/AcmeCo/api && airlock run${N}      client work, whitelist network
+    ${DIM}cd ~/Codebases/AcmeCo/web && airlock run${N}      2nd project at once — busy ports move, same cache
+    ${DIM}airlock run --ephemeral vercel deploy${N}         deploy; login dies on exit
+    ${DIM}airlock run npm test${N}                          one-off command
+    ${DIM}airlock allow files.example.com${N}               widen the whitelist (instant)
+    ${DIM}airlock reset acmeco${N}                          wipe that client's cached home
 
-  ${DIM}The folder you launch from becomes /workspace — the only host folder the
-  sandbox sees. Bind dev servers to 0.0.0.0 to reach them at localhost on your Mac.${N}
+  ${DIM}The folder you launch from is mounted at the same path inside, and
+  Claude sessions are saved per project in your Mac's ~/.claude. Ports are
+  1:1 when free (localhost:3000 inside = on your Mac); dev servers bound to
+  localhost are forwarded, no --host flag needed.${N}
 EOF
 }
 
@@ -257,49 +875,92 @@ cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   run|shell)
-    ensure_built
+    parse_mode_flags "$@"; set -- "${PARSED_ARGS[@]+"${PARSED_ARGS[@]}"}"
     set_workspace
-    sync_claude_creds
+    ensure_docker
+    attach_if_running untrusted "$@"
+    if [ "$WIPE_HOME" = 1 ] && [ "$HOME_MODE" = persistent ]; then
+      echo "${DIM}› --fresh: removing home volume $(home_volume_name untrusted)…${N}"
+      docker volume rm "$(home_volume_name untrusted)" >/dev/null 2>&1 || true
+    fi
+    ensure_built run
+    plan_ports untrusted
+    load_claude_login
+    sync_claude_md
+    prepare_run_sessions
+    [ "$HOME_MODE" = persistent ] && mark_volume_used "$(home_volume_name untrusted)"
+    maybe_auto_clean
+    maybe_auto_update
     launch_banner run
-    # When this sandbox shell exits (or Ctrl-C), stop the proxy too — unless
-    # another sandbox terminal is still running. Keeps no internet-connected
-    # container lingering once you're done.
-    trap teardown_proxy_if_idle EXIT
+    # When this sandbox shell exits — or the terminal is closed — remove the
+    # container and stop the proxy too, unless another sandbox terminal for
+    # this project is still running.
+    arm_cleanup untrusted
+    start_block_notifier
     if [ "$#" -eq 0 ]; then
-      dc --profile run run --rm --service-ports untrusted bash
+      dc --profile run run --rm --service-ports --name "$SANDBOX_NAME" untrusted "${SHELL_CMD[@]}"
     else
-      dc --profile run run --rm --service-ports untrusted "$@"
+      dc --profile run run --rm --service-ports --name "$SANDBOX_NAME" untrusted "$@"
     fi
     ;;
 
   dev)
-    ensure_built
+    parse_mode_flags "$@"; set -- "${PARSED_ARGS[@]+"${PARSED_ARGS[@]}"}"
     set_workspace
-    sync_claude_creds
+    ensure_docker
+    attach_if_running dev "$@"
+    if [ "$WIPE_HOME" = 1 ] && [ "$HOME_MODE" = persistent ]; then
+      echo "${DIM}› --fresh: removing home volume $(home_volume_name dev)…${N}"
+      docker volume rm "$(home_volume_name dev)" >/dev/null 2>&1 || true
+    fi
+    ensure_built dev
+    plan_ports dev
+    load_claude_login
+    # dev mounts ~/.claude itself; create it so Docker never has to.
+    mkdir -p "$HOME/.claude"
+    link_claude_md_dev
+    [ "$HOME_MODE" = persistent ] && mark_volume_used "$(home_volume_name dev)"
+    maybe_auto_clean
+    maybe_auto_update
     launch_banner dev
+    arm_cleanup dev
     if [ "$#" -eq 0 ]; then
-      dc --profile dev run --rm --service-ports dev bash
+      dc --profile dev run --rm --service-ports --name "$SANDBOX_NAME" dev "${SHELL_CMD[@]}"
     else
-      dc --profile dev run --rm --service-ports dev "$@"
+      dc --profile dev run --rm --service-ports --name "$SANDBOX_NAME" dev "$@"
     fi
     ;;
 
   exec)
+    set_identity
     cid="$(running_sandbox || true)"
     if [ -z "${cid:-}" ]; then
-      echo "✗ no running sandbox — start one first: airlock run   (or: airlock dev)"
+      echo "✗ no running sandbox for this project — start one first: airlock run"
       exit 1
     fi
     echo "› attaching to running sandbox $cid"
-    if [ "$#" -eq 0 ]; then docker exec -it "$cid" bash; else docker exec -it "$cid" "$@"; fi
+    if [ "$#" -eq 0 ]; then docker exec -it "$cid" "${SHELL_CMD[@]}"; else docker exec -it "$cid" "$@"; fi
+    ;;
+
+  reset)
+    set_identity
+    ensure_docker
+    client="$(slugify "${1:-$AIRLOCK_CLIENT}")"
+    gone=0
+    for m in untrusted dev; do
+      vol="$(home_volume_name "$m" "$client")"
+      if docker volume inspect "$vol" >/dev/null 2>&1; then
+        echo "› removing ${C}${vol}${N} ${DIM}(caches, logins, Claude history)${N}"
+        docker volume rm "$vol" >/dev/null && gone=$(( gone + 1 ))
+      fi
+    done
+    [ "$gone" = 0 ] && echo "› no home volumes for client '${client}' — nothing to reset" || echo "› done ($gone removed)"
     ;;
 
   sbx)
     sbx_require
     set_workspace
     name="$(sbx_name)"
-
-    # Subcommands / flags (KEEP by default; --fresh deletes the old one first).
     case "${1:-}" in
       down|rm)
         if sbx_exists "$name"; then
@@ -319,12 +980,10 @@ case "$cmd" in
         fi
         ;;
     esac
-
-    # Reuse the kept microVM if it exists; otherwise create one.
     if sbx_exists "$name"; then
       echo "${DIM}› reusing microVM '$name' — login + installs from last time persist${N}"
     else
-      ensure_built            # the template reuses airlock's tooling image
+      ensure_built dev
       echo "${DIM}› creating microVM sandbox '$name'…${N}"
       if [ -n "$SBX_TEMPLATE" ]; then
         dsbx create --name "$name" --template "$SBX_TEMPLATE" shell "$WORKSPACE"
@@ -334,81 +993,164 @@ case "$cmd" in
     fi
     echo "${DIM}› applying egress whitelist (default-deny)…${N}"
     sbx_apply_whitelist "$name"
-    # Claude isn't auto-seeded (sbx mounts only the project) — but the box is
-    # KEPT, so `/login` once inside and it persists across future spins.
     CLAUDE_STATE="${DIM}run /login once — it persists (sandbox is kept)${N}"
     launch_banner sbx
-    # KEEP by default: no teardown on exit. New box: airlock sbx --fresh.
-    # Destroy: airlock sbx down.
     if [ "$#" -eq 0 ]; then
       dsbx run "$name"
     elif [ -t 0 ]; then
       dsbx exec -it "$name" "$@"
     else
-      dsbx exec -i "$name" "$@"   # piped/no-TTY: don't request a pseudo-TTY
+      dsbx exec -i "$name" "$@"
     fi
     ;;
 
   allow)
-    [ "$#" -ge 1 ] || { echo "usage: airlock allow <domain>   e.g. airlock allow example.com"; exit 1; }
-    dom="$1"
-    # Escape dots, anchor to end-of-host so subdomains of it match.
-    printf '\\.%s$\n' "$(echo "$dom" | sed 's/^\*\.//; s/\./\\./g')" >> "$FILTER"
-    echo "› added '$dom' to whitelist. Rebuild to apply:  airlock rebuild"
+    set_identity
+    if [ "$#" -eq 0 ]; then
+      # No domain given: pick from what this project's proxy actually blocked.
+      picks=()
+      while IFS= read -r h; do [ -n "$h" ] && picks+=("$h"); done \
+        < <(proxy_log | blocked_hosts)
+      if [ "${#picks[@]}" -eq 0 ]; then
+        echo "› nothing blocked for this project yet."
+        echo "  usage: airlock allow <domain> [more…]   e.g. airlock allow api.example.com"
+        exit 0
+      fi
+      echo "  ${B}Blocked for ${COMPOSE_PROJECT_NAME#airlock-}:${N}"
+      for i in "${!picks[@]}"; do printf "    %2d) %s\n" "$(( i + 1 ))" "${picks[$i]}"; done
+      printf "  allow which? ${DIM}(numbers, e.g. 1 3 — 'a' for all, Enter to cancel)${N} "
+      read -r ans || ans=""
+      sel=()
+      if [ "$ans" = a ]; then sel=("${picks[@]}")
+      else for n in $ans; do
+        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#picks[@]}" ] && sel+=("${picks[$(( n - 1 ))]}")
+      done; fi
+      [ "${#sel[@]}" -gt 0 ] || { echo "› nothing changed"; exit 0; }
+      set -- "${sel[@]}"
+    fi
+    for dom in "$@"; do allow_domain "$dom" || true; done
+    # The filter is bind-mounted now, so a proxy restart is enough — no rebuild.
+    cid="$(proxy_cid || true)"
+    if [ -n "${cid:-}" ]; then
+      docker restart "$cid" >/dev/null && echo "› proxy reloaded — active now"
+    else
+      echo "› takes effect on the next 'airlock run' (no rebuild needed)"
+    fi
     ;;
 
   down)
-    echo "› stopping sandbox + proxy…"
-    dc --profile run --profile dev down --remove-orphans >/dev/null 2>&1 || true
-    docker ps -a --format '{{.ID}} {{.Names}}' \
-      | grep -E 'airlock-(untrusted|dev)-run' | awk '{print $1}' \
-      | xargs -r docker rm -f >/dev/null 2>&1 || true
-    # remove any airlock sbx microVMs too
-    if docker sandbox version >/dev/null 2>&1; then
-      docker sandbox ls 2>/dev/null | grep -oE 'airlock-[A-Za-z0-9._+-]+' | sort -u \
-        | xargs -r -n1 docker sandbox rm >/dev/null 2>&1 || true
+    set_identity
+    docker_running || { echo "› Docker isn't running — nothing to stop"; exit 0; }
+    if [ "${1:-}" = "--all" ]; then
+      down_all
+    else
+      echo "› stopping sandbox + proxy for ${C}${COMPOSE_PROJECT_NAME}${N}…"
+      dc --profile run --profile dev down --remove-orphans >/dev/null 2>&1 || true
+      docker ps -a --format '{{.ID}} {{.Names}}' \
+        | grep -E " ${COMPOSE_PROJECT_NAME}-(untrusted|dev)-run" | awk '{print $1}' \
+        | xargs -r docker rm -f >/dev/null 2>&1 || true
     fi
+    echo "${DIM}› home volumes are kept — wipe one with: airlock reset [client]${N}"
     echo "› done"
     ;;
 
+  off)
+    set_identity
+    if docker_running; then
+      down_all
+      echo "› quitting Docker Desktop — its VM memory goes back to macOS…"
+      docker desktop stop >/dev/null 2>&1 || osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+    else
+      echo "› Docker is already stopped"
+    fi
+    echo "› done — 'airlock run' / 'airlock dev' start Docker again automatically"
+    ;;
+
+  login)
+    echo "› step 1: create a long-lived Claude token (opens your browser)"
+    if command -v claude >/dev/null 2>&1; then
+      claude setup-token || true
+    else
+      echo "  run on your Mac: claude setup-token"
+    fi
+    echo ""
+    echo "› step 2: paste that token below (input is hidden, asked twice)."
+    echo "  ${DIM}Saved to your macOS Keychain as '${TOKEN_SERVICE}' — never to a file.${N}"
+    # -w as the LAST option makes `security` prompt, so the token never
+    # appears in argv / the process list.
+    security add-generic-password -U -a "$USER" -s "$TOKEN_SERVICE" -l "airlock Claude token" -w
+    echo "› saved — every new sandbox uses it; no more \"Login expired\""
+    ;;
+
+  logout)
+    if security delete-generic-password -s "$TOKEN_SERVICE" >/dev/null 2>&1; then
+      echo "› removed — sandboxes fall back to your Keychain Claude login"
+    else
+      echo "› no airlock token stored — nothing to remove"
+    fi
+    ;;
+
   status)
+    set_identity
+    if ! docker_running; then
+      echo "  ${B}airlock — status${N}  ${DIM}Docker is stopped — using no RAM. 'airlock run' / 'dev' start it.${N}"
+      exit 0
+    fi
     echo ""
     hr; echo "  ${B}airlock — status${N}"; hr
     echo ""
+    echo "  ${B}This project${N}"
+    echo "    path      ${C}${WORKSPACE}${N}"
+    echo "    client    ${C}${AIRLOCK_CLIENT}${N}   ${DIM}compose project ${COMPOSE_PROJECT_NAME}${N}"
+    echo "    ports     ${DIM}$(compact_ports "$(wanted_ports)") — 1:1 when free, busy ones move to 1<port>${N}"
+    echo ""
 
-    # ---- images ----
     echo "  ${B}Images${N}"
     if image_exists "$SANDBOX_IMAGE"; then echo "    ${G}✓${N} sandbox   ${DIM}${SANDBOX_IMAGE}${N}"
     else echo "    ${R}✗${N} sandbox   ${DIM}${SANDBOX_IMAGE}${N}   ${Y}→ run: airlock build${N}"; fi
     if image_exists "$PROXY_IMAGE"; then echo "    ${G}✓${N} proxy     ${DIM}${PROXY_IMAGE}${N}"
     else echo "    ${R}✗${N} proxy     ${DIM}${PROXY_IMAGE}${N}   ${Y}→ run: airlock build${N}"; fi
+    age="$(days_since "$STATE_DIR/last-update")"
+    if [ -z "$age" ]; then echo "    ${Y}tools never updated by airlock${N} ${DIM}→ airlock update${N}"
+    else echo "    ${DIM}tools updated ${age} day(s) ago · auto every ${UPDATE_DAYS} days · now: airlock update${N}"; fi
+    image_exists "$SANDBOX_IMAGE" && image_versions | awk '{printf "      %-9s %s\n", $1, substr($0, length($1)+2)}' | sed "s/^/${DIM}/; s/\$/${N}/"
     echo ""
 
-    # ---- running ----
+    echo "  ${B}Client home volumes${N}"
+    vols="$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^airlock-home-' || true)"
+    if [ -z "$vols" ]; then
+      echo "    ${DIM}none yet — created on first run${N}"
+    else
+      printf '%s\n' "$vols" | while read -r v; do
+        mark=" "
+        case "$v" in "$(home_volume_name untrusted)"|"$(home_volume_name dev)") mark="${G}•${N}" ;; esac
+        echo "    ${mark} ${C}${v#airlock-home-}${N}  ${DIM}${v}${N}"
+      done
+    fi
+    echo ""
+
     echo "  ${B}Running now${N}"
     found=0
+    stats="$(docker stats --no-stream --format '{{.Name}}	{{.MemUsage}}' 2>/dev/null || true)"
     while IFS=$'\t' read -r name st; do
       [ -z "$name" ] && continue
       found=1
+      mem="$(printf '%s\n' "$stats" | awk -F'\t' -v n="$name" '$1==n {split($2, a, " / "); print a[1]}')"
+      [ -n "$mem" ] && st="$st · ${mem} RAM"
       case "$name" in
         *untrusted*) echo "    🔒 ${G}SAFE${N}     ${name}  ${DIM}· untrusted · whitelist net · ${st}${N}" ;;
-        *dev*)       echo "    ⚠  ${Y}TRUSTED${N}  ${name}  ${DIM}· full internet + history · ${st}${N}" ;;
+        *dev*)       echo "    ⚠  ${Y}TRUSTED${N}  ${name}  ${DIM}· full internet · ${st}${N}" ;;
         *proxy*)     echo "    🛡  ${C}proxy${N}    ${name}  ${DIM}· egress whitelist · ${st}${N}" ;;
         *)           echo "    • ${name}  ${DIM}· ${st}${N}" ;;
       esac
     done < <(docker ps --filter "name=airlock" --format '{{.Names}}\t{{.Status}}')
     [ "$found" = 0 ] && echo "    ${DIM}nothing running — sandboxes are disposable, this is normal${N}"
+    vm_gib="$(docker info --format '{{.MemTotal}}' 2>/dev/null | awk '{printf "%.1f", $1/1073741824}')"
+    echo "    ${DIM}Docker VM holds ${vm_gib} GiB while Docker runs · give it back: airlock off${N}"
     echo ""
 
-    # ---- modes ----
-    echo "  ${B}Modes${N}"
-    echo "    ${G}airlock run${N}   🔒 ${G}safe${N}     ${DIM}untrusted code · whitelist network · no history${N}"
-    echo "    ${Y}airlock dev${N}   ⚠  ${Y}trusted${N}  ${DIM}your code · full internet · Claude history${N}"
-    echo ""
-
-    # ---- whitelist (readable) ----
     wl_count="$(readable_whitelist | wc -l | tr -d ' ')"
-    echo "  ${B}Network whitelist${N}  ${DIM}· ${wl_count} domains reachable in 'run' mode; all others blocked${N}"
+    echo "  ${B}Network whitelist${N}  ${DIM}· ${wl_count} rules reachable in 'run' mode; all others blocked${N}"
     printf '%s' "$C"
     readable_whitelist | awk '{printf "    %-26s", $0; if (NR%2==0) printf "\n"} END {if (NR%2) printf "\n"}'
     printf '%s' "$N"
@@ -417,9 +1159,10 @@ case "$cmd" in
     ;;
 
   blocked)
-    if docker ps --format '{{.Names}}' | grep -q '^airlock-proxy$'; then src="live"; else src="last session"; fi
+    set_identity
+    if [ -n "$(proxy_cid || true)" ]; then src="live"; else src="last session"; fi
     echo ""
-    hr; echo "  ${B}airlock — blocked egress${N}  ${DIM}· ${src}${N}"; hr
+    hr; echo "  ${B}airlock — blocked egress${N}  ${DIM}· ${src} · ${COMPOSE_PROJECT_NAME}${N}"; hr
     blk="$(proxy_log | sed -nE 's/.*Proxying refused on filtered domain "([^"]+)".*/\1/p' | sort | uniq -c | sort -rn)"
     if [ -z "$blk" ]; then
       echo "    ${G}nothing blocked${N} ${DIM}— no denied requests recorded${N}"
@@ -429,13 +1172,117 @@ case "$cmd" in
         printf "    ${R}✗${N} ${C}https://%s${N}%*s${DIM}%s×${N}\n" "$host" $(( 34 - ${#host} > 1 ? 34 - ${#host} : 1 )) "" "$n"
       done
       echo ""
-      echo "    ${DIM}to permit one:${N} airlock allow <domain>   ${DIM}then${N} airlock rebuild"
+      echo "    ${DIM}to permit one:${N} airlock allow <domain>   ${DIM}(instant — no rebuild)${N}"
     fi
     hr
     ;;
-  build)   dc --profile run --profile dev build "$@" ;;
-  rebuild) dc --profile run --profile dev build --no-cache "$@" ;;
-  logs)    docker logs -f airlock-proxy ;;
+
+  # Each build re-tags :latest and leaves the old ~2 GB image dangling.
+  build)   set_identity; ensure_docker; dc --profile run --profile dev build "$@"
+           docker image prune -f >/dev/null 2>&1 || true ;;
+  rebuild) set_identity; ensure_docker; dc --profile run --profile dev build --no-cache "$@"
+           docker image prune -f >/dev/null 2>&1 || true ;;
+
+  update)
+    set_identity; ensure_docker
+    mkdir -p "$STATE_DIR"
+    # One at a time: a manual update while the background one runs would
+    # just do the same multi-minute build twice.
+    if ! mkdir "$STATE_DIR/update.lock" 2>/dev/null; then
+      echo "› an update is already running — see .logs/update-last.log"; exit 0
+    fi
+    trap 'rmdir "$STATE_DIR/update.lock" 2>/dev/null || true' EXIT
+    echo "› updating to the latest: Node ${AIRLOCK_NODE_VERSION:-LTS} base + OS packages, npm, pnpm, nvm,"
+    echo "  Claude Code, vercel, netlify, heroku, firebase, wrangler, tinyproxy…"
+    echo "  ${DIM}(a few minutes; running sandboxes keep their version until you restart them)${N}"
+    if dc --profile run --profile dev build --pull --build-arg AIRLOCK_REFRESH="$(date +%s)"; then
+      date +%s > "$STATE_DIR/last-update"
+      docker image prune -f >/dev/null 2>&1 || true   # the version it replaced
+      echo "› up to date:"
+      image_versions | sed 's/^/    /'
+      [ "${1:-}" = --auto ] && command -v osascript >/dev/null 2>&1 \
+        && osascript -e 'display notification "Node, Claude Code and the deploy CLIs are on their latest versions." with title "airlock updated"' >/dev/null 2>&1 || true
+    else
+      echo "${R}✗ update failed — your current image is untouched.${N} Retry: airlock update"
+      exit 1
+    fi
+    ;;
+
+  clean)
+    docker_running || { echo "› Docker isn't running — nothing to clean"; exit 0; }
+    case "${1:-}" in
+      ""|--auto|--stale|--deep) airlock_clean "${1:-}" ;;
+      *) echo "usage: airlock clean [--stale | --deep]"; exit 1 ;;
+    esac
+    [ "${1:-}" = --auto ] || echo "› done — see what's left: airlock disk"
+    ;;
+
+  disk|df)
+    ensure_docker
+    echo ""
+    hr; echo "  ${B}airlock — disk${N}"; hr
+    pct="$(vm_disk_pct || true)"
+    if [ -n "$pct" ]; then
+      [ "$pct" -ge "$DISK_WARN_PCT" ] && col="$R" || col="$G"
+      echo "  Docker's VM disk is ${col}${pct}% full${N}"
+    fi
+    echo ""
+    docker system df 2>/dev/null | sed 's/^/  /'
+    echo ""
+    echo "  ${B}Client home volumes${N}  ${DIM}(caches, logins, Claude history)${N}"
+    docker system df -v 2>/dev/null | awk '/^airlock-home-/ {print $1, $NF}' \
+      | while read -r v size; do
+          idle="$(volume_idle_days "$v")"
+          if volume_in_use "$v"; then age="${G}in use${N}"
+          elif [ -z "$idle" ]; then age="${DIM}not tracked yet${N}"
+          elif [ "$idle" -ge "$STALE_DAYS" ]; then age="${Y}unused ${idle}d${N}"
+          else age="${DIM}used ${idle}d ago${N}"; fi
+          printf "    %-44s %9s   %s\n" "$v" "$size" "$age"
+        done
+    echo ""
+    echo "  ${DIM}free space:${N}  airlock clean          ${DIM}leftovers + old builds + package caches${N}"
+    echo "               airlock clean --stale  ${DIM}…and delete volumes unused >${STALE_DAYS} days${N}"
+    echo "               airlock clean --deep   ${DIM}…and ALL build cache (next build is slow)${N}"
+    echo "               airlock reset <client> ${DIM}delete one client's volumes${N}"
+    hr
+    ;;
+
+  guard)
+    case "${1:-status}" in
+      on|install)
+        chmod +x "$DIR/shell/guard.sh" 2>/dev/null || true
+        for rc in "${GUARD_RCS[@]}"; do
+          [ -e "$rc" ] || continue
+          if grep -q '# airlock guard$' "$rc"; then echo "✓ already on in $rc"
+          else printf '\n%s\n' "$(guard_line)" >> "$rc"; echo "✓ guard added to $rc"; fi
+        done
+        echo "› open a new terminal (or: source ~/.zshrc). Typing npm/pnpm/yarn/npx/bun/node"
+        echo "  inside a project on your Mac now asks to run it in airlock instead."
+        ;;
+      off|uninstall)
+        for rc in "${GUARD_RCS[@]}"; do
+          [ -e "$rc" ] && grep -q '# airlock guard$' "$rc" || continue
+          tmp="$(mktemp)"; grep -v '# airlock guard$' "$rc" > "$tmp" && cat "$tmp" > "$rc"; rm -f "$tmp"
+          echo "✓ guard removed from $rc"
+        done
+        echo "› takes effect in new terminals"
+        ;;
+      status)
+        on=0
+        for rc in "${GUARD_RCS[@]}"; do [ -e "$rc" ] && grep -q '# airlock guard$' "$rc" && { echo "  ${G}on${N}   $rc"; on=1; }; done
+        [ "$on" = 1 ] || echo "  ${Y}off${N}  turn on: airlock guard on"
+        t="$HOME/.config/airlock/trusted"
+        if [ -s "$t" ]; then echo "  ${B}trusted on the Mac${N} ${DIM}(guard skips these — edit $t)${N}"; sed 's/^/    /' "$t"; fi
+        ;;
+      *) echo "usage: airlock guard [on|off|status]"; exit 1 ;;
+    esac
+    ;;
+  logs)
+    set_identity
+    cid="$(proxy_cid || true)"
+    if [ -z "${cid:-}" ]; then echo "✗ no proxy running for this project"; exit 1; fi
+    docker logs -f "$cid"
+    ;;
 
   help|-h|--help) print_help ;;
   *) echo "unknown command: $cmd"; echo "try: airlock --help"; exit 1 ;;

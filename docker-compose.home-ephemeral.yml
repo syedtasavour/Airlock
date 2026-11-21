@@ -1,0 +1,13 @@
+# Layered by the `airlock` wrapper for:  airlock run --ephemeral
+#
+# Restores the original throwaway behaviour: /home/node is a RAM-backed tmpfs
+# wiped the moment the container stops. Use this for deploy sessions — you want
+# `vercel login` / `heroku login` credentials to be gone when you exit, not
+# sitting in a persistent volume.
+services:
+  untrusted:
+    tmpfs:
+      - /home/node:exec,uid=1000,gid=1000,size=1g
+  dev:
+    tmpfs:
+      - /home/node:exec,uid=1000,gid=1000,size=1g

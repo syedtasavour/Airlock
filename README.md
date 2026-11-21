@@ -11,7 +11,8 @@ secrets.**
 ---
 
 Think of it as an airlock between sketchy code and your real machine: code goes
-in, does its work, the container is destroyed on exit. Nothing leaks out.
+in, does its work, the container is destroyed on exit. Only the project folder
+and a per-client home volume (or nothing at all, with `--ephemeral`) remain.
 
 ```bash
 cd ~/some/cloned/oss-project
@@ -26,13 +27,15 @@ airlock run        # locked-down, throwaway shell — safe to run anything
 - [Why use it even for your *own* code](#why-use-it-even-for-your-own-code)
 - [Three modes](#three-modes)
 - [Which mode? — use cases, rated by safety & cost](#which-mode--use-cases-rated-by-safety--cost)
+- [Making it a habit — `airlock guard`](#making-it-a-habit--airlock-guard)
+- [Disk space — why it filled up, and what keeps it clean now](#disk-space--why-it-filled-up-and-what-keeps-it-clean-now)
 - [Setup (fresh / reset Mac)](#setup-fresh--reset-mac)
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Networking — the whitelist](#networking--the-whitelist)
 - [Multiple terminals](#multiple-terminals)
 - [Dev servers / ports](#dev-servers--ports)
-- [Claude login](#claude-login)
+- [Claude login & sessions](#claude-login--sessions)
 - [Security model — and its limits](#security-model--and-its-limits)
 - [Layout](#layout)
 - [Copyright](#copyright)
@@ -57,7 +60,7 @@ time you notice, your keys are gone.
 |---|---|---|
 | Read your secrets | full home dir access | only the project folder is mounted |
 | Send them out | any internet host | egress blocked except a domain whitelist |
-| Persist / spread | writes anywhere | read-only root, throwaway container |
+| Persist / spread | writes anywhere | read-only root, throwaway container, home quarantined per client & mode |
 
 This is the same model Anthropic uses to contain Claude Code:
 **filesystem isolation + network egress control.** Either one alone is not
@@ -69,9 +72,10 @@ enough — isolation stops escape, egress control stops exfiltration.
 
 - **Running untrusted open-source.** Clone it, `airlock run`, poke at it. If
   it's malware, it can't reach your keys or phone home.
-- **Deploying for clients with many accounts.** Each spin is logged out, so you
-  `vercel login` / `heroku login` fresh as the right client every time — no
-  cross-account mix-ups, no credentials persisted on disk.
+- **Deploying for clients with many accounts.** Each client gets its own home
+  volume, so one client's `vercel` / `heroku` login never shows up in another's
+  sandbox. For a deploy whose login should die on exit, use
+  `airlock run --ephemeral` — nothing is persisted on disk.
 - **Trying a sketchy CLI / install script.** `curl … | bash`-style installers
   run contained instead of as you.
 - **Reproducing a Linux-only bug** from your Mac without dual-booting.
@@ -107,15 +111,36 @@ workstation:
 |---|---|---|---|
 | **Use for** | OSS you don't trust | your own code | hostile code / agents |
 | **Isolation** | container (shared kernel) | container (shared kernel) | **microVM (own kernel)** |
-| **Host secrets** | only the Claude **token** | Claude token **+ history** | none (project only) |
+| **Host secrets** | Claude **token** + **this project's** sessions | Claude token **+ all history** | none (project only) |
 | **Network** | 🔒 whitelist proxy only | 🌐 full internet | 🔒 whitelist proxy only |
 | **Filesystem** | only the project dir | only the project dir | only the project dir |
-| **Claude Code** | ✅ logged in (no history) | ✅ logged in (full history) | use `docker sandbox run claude` |
+| **Claude Code** | ✅ logged in · sessions saved on your Mac, per project | ✅ logged in (full history) | use `docker sandbox run claude` |
 | **Cost** | light | light | heavier (VM RAM + boot) |
 
 `run` and `dev` share the hardening: non-root user, **read-only root filesystem**,
-all Linux capabilities dropped, no privilege escalation, RAM-backed ephemeral
-home, CPU / memory / PID limits, and a throwaway (`--rm`) container.
+all Linux capabilities dropped, no privilege escalation, memory / PID limits,
+and a throwaway (`--rm`) container.
+
+### Home directory: persistent (default) or ephemeral
+
+The container is always destroyed on exit, but `/home/node` is not, by default:
+
+| | default | `--ephemeral` |
+|---|---|---|
+| **`/home/node`** | named volume per **client** and per **mode** | RAM-backed tmpfs |
+| **Survives exit** | caches, logins, nvm versions, Claude history | nothing |
+| **Use for** | everyday work (fast restarts, warm caches) | deploy sessions, hostile code |
+
+- The client comes from `$AIRLOCK_CLIENT`, then a `.airlock-client` file in the
+  project, then the parent directory's name. Volumes are named
+  `airlock-home-<client>-untrusted` and `airlock-home-<client>-dev`.
+- `run` and `dev` **never share a home**. That split is a security boundary:
+  a poisoned `~/.bashrc` or a shim in `~/.local/bin` written by untrusted code
+  stays in the untrusted volume, so `dev` (full internet + your Claude history)
+  never runs it.
+- But within `run`, whatever untrusted code leaves in the home **is still there
+  next spin**. For genuinely sketchy code, use `--ephemeral`, or wipe it:
+  `airlock run --fresh` (this mode only) or `airlock reset [client]` (both).
 
 `sbx` adds a **separate Linux kernel** (Docker Sandbox microVM) so even a
 container-escape 0-day can't reach your Mac — with airlock's same egress
@@ -129,8 +154,8 @@ startup time. Pick the lightest mode that covers your threat.
 | Scenario | Mode | Safety | Cost |
 |---|---|:---:|:---:|
 | `npm install` / clone a random OSS repo | `run` | 🟢🟢🟢🟢 | 🪶 light |
-| Run a `curl … \| bash` installer you don't trust | `run` | 🟢🟢🟢🟢 | 🪶 light |
-| Deploy for a client (fresh `vercel`/`heroku` login) | `run` | 🟢🟢🟢🟢 | 🪶 light |
+| Run a `curl … \| bash` installer you don't trust | `run --ephemeral` | 🟢🟢🟢🟢 | 🪶 light |
+| Deploy for a client (fresh `vercel`/`heroku` login) | `run --ephemeral` | 🟢🟢🟢🟢 | 🪶 light |
 | Genuinely **hostile** code / malware analysis | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
 | An **autonomous AI agent** with shell access | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
 | Untrusted code that needs an **escape-proof** boundary | `sbx` | 🟢🟢🟢🟢🟢 | 🔋 heavy |
@@ -159,6 +184,59 @@ sbx   🟢🟢🟢🟢🟢   microVM (own kernel) + whitelist + no secrets   —
 run   🟢🟢🟢🟢     container + whitelist + token-only             — untrusted OSS, deploys
 dev   🟡🟡         container + full internet + your history       — your own trusted code
 ```
+
+---
+
+## Making it a habit — `airlock guard`
+
+airlock only protects you when you use it, and the dangerous moment is the
+one you don't think about: typing `npm i` in a repo you were just given.
+`airlock guard on` (setup turns it on) wraps `npm`, `npx`, `pnpm`, `yarn`,
+`bun`, `node` and `corepack` in your Mac's shell. Inside a project (any folder
+with a `package.json` below your home), typing one of them asks first:
+
+```
+  ⚠  airlock guard — `npm install` would run on your Mac, as you.
+     project ~/Codebases/ClientCo/web
+     Enter = airlock run   r = run (untrusted)   d = dev (your own code)
+     h = on the Mac, just once   t = always allow on the Mac here   n = cancel
+```
+
+- **Enter** runs the exact command in airlock, mounting the repo root and
+  starting in the same subfolder. If that project's sandbox is already open,
+  it runs in that one. Your choice of `run`/`dev` is remembered per project.
+- **t** trusts the project on the Mac for good (stored in
+  `~/.config/airlock/trusted`; delete the line to undo).
+- Only commands **you type** are affected: scripts, editors, git hooks and
+  other tools still call the real binaries. Bypass once with `command npm …`
+  or `AIRLOCK_GUARD=0 npm …`. Turn it off with `airlock guard off`.
+
+---
+
+## Disk space — why it filled up, and what keeps it clean now
+
+After days of use across several projects, Docker reported its disk full.
+The causes, and what airlock does about each now:
+
+| What grew | Why | Now |
+|---|---|---|
+| npm / pnpm / yarn caches in each client's home volume | only ever grow; pnpm can't hard-link across the project mount, so its store is a full extra copy | trimmed when a volume's caches pass **3 GB** (`AIRLOCK_CACHE_LIMIT_GB`) |
+| old sandbox images (~2 GB each) | every `airlock build` left the previous one behind | removed after each build and daily |
+| BuildKit cache | never pruned | cache unused for 7 days is removed daily |
+| volumes of clients you stopped working on | kept forever | flagged after **30 days** unused; `airlock clean --stale` deletes them |
+| container logs | unbounded (the proxy logs every connection) | capped at 2 × 10 MB per container |
+| leftover containers / networks (closed lid, crashed terminal) | exit cleanup never ran | removed daily (orphan networks also cause "no available IPv4 address pool") |
+
+The light clean (`airlock clean --auto`) runs **by itself**, in the
+background, at most once a day when you start `run` or `dev`. It never
+deletes a volume, never touches one that's in use, and only removes package
+caches, which re-download (logins, nvm versions and Claude history stay).
+When Docker's disk passes 75 % or stale volumes pile up, the launch banner
+says so. `airlock disk` shows the breakdown; `AIRLOCK_AUTO_CLEAN=0` turns
+the daily run off.
+
+`/tmp` inside the sandbox is now 1 GB (it was 256 MB, which large Next/Vite
+builds filled up with `ENOSPC: no space left on device`).
 
 ---
 
@@ -194,9 +272,9 @@ Docker Desktop for your chip, then you re-run it.
 ```bash
 # UNTRUSTED: clone something sketchy and run it safely
 cd ~/some/cloned/oss-project
-airlock run                       # locked-down shell at /workspace
-#   inside: npm install && npm run dev -- -H 0.0.0.0
-#   open http://localhost:3000 on your Mac
+airlock run                       # locked-down shell in the project folder
+#   inside: npm install && npm run dev
+#   open http://localhost:3000 on your Mac (the banner says if it moved)
 
 # TRUSTED: work on your own code with Claude
 cd ~/CodeBase/MyProject
@@ -204,35 +282,67 @@ airlock dev
 #   inside: claude
 ```
 
-The folder you launch from becomes `/workspace` — the **only** host folder the
-container can see.
+The folder you launch from is mounted at the **same path** as on your Mac, in
+both modes. In `run` it's the **only** project folder the container can see;
+`dev` also gets your `~/.claude` history. Claude sessions are saved on your
+Mac per project in both (see [Claude login & sessions](#claude-login--sessions)).
 
 ### Toolchain
 
-- **Node 24.16** (default), **pnpm** and **npm** preinstalled and working offline.
-- **nvm** is available to switch Node versions: `nvm install 20 && nvm use 20`.
-  Because the sandbox home is ephemeral, nvm-installed versions last for the
-  current session (re-install next spin). The default 24.16 is always present.
-- Deploy CLIs: **vercel · netlify · heroku · firebase · wrangler**. Plus
-  **git**, **ripgrep**, and **claude** (Claude Code).
+- **Always the latest.** Node (latest **LTS**), npm, **pnpm**, **nvm**,
+  **Claude Code** and the deploy CLIs (**vercel · netlify · heroku · firebase ·
+  wrangler**) are never pinned. `airlock update` rebuilds with all of them at
+  their newest release, and it **runs by itself in the background every 3 days**
+  (`AIRLOCK_UPDATE_DAYS`, or `AIRLOCK_AUTO_UPDATE=0` to stop). A running
+  sandbox keeps its versions; the next launch gets the new ones. `airlock
+  status` shows what's installed and when it was last updated.
+  (Before, a rebuild reused Docker's cached layers, so the tools stayed at
+  whatever the first build downloaded.)
+- Need a different default Node major? `AIRLOCK_NODE_VERSION=24 airlock update`.
+  Per project, **nvm** switches inside: `nvm install 20 && nvm use 20`.
+  nvm-installed versions live in the home volume, so they survive the next spin
+  (with `--ephemeral`, they're gone on exit).
+- Plus **git**, **ripgrep**, **jq** and **fzf**. All work offline in `run`.
+- **zsh, set up the same as your Mac** (`shell/zshrc.zsh`, loaded by both):
+  history with the time and duration of every command (`history -iD`), grey
+  **predictions** from history as you type (→ accepts), syntax colours, ↑/↓
+  search for commands starting with what you typed, Ctrl-R fuzzy history.
+  Start a command with a space to keep it out of history. Inside the sandbox,
+  history is **per project** (in the client's home volume), and the prompt
+  shows `[airlock:run]` / `[airlock:dev]`.
+- **Claude's status line** is the same script on the Mac and in both modes
+  (`statusline/statusline-command.sh`), with an `airlock:run`/`airlock:dev`
+  badge inside so you always know where you are.
 
 ---
 
 ## Commands
 
 ```
-airlock run [CMD]   UNTRUSTED mode — no history, whitelist-only network
-airlock dev [CMD]   TRUSTED mode — Claude login + full internet
+airlock run [CMD]   UNTRUSTED mode — whitelist-only network, per-project sessions
+airlock dev [CMD]   TRUSTED mode — Claude login + full internet + Mac history
 airlock sbx [CMD]   STRONGEST — Docker microVM (own kernel) + same whitelist
 airlock exec [CMD]  open ANOTHER terminal into the running sandbox
-airlock allow DOM   add a domain to the egress whitelist (then rebuild)
+  flags (run/dev):  --ephemeral  tmpfs home, destroyed on exit
+                    --fresh      wipe this mode's home volume first
+airlock reset [CL]  wipe a client's home volumes (both modes)
+airlock allow [DOM] add domains to the whitelist (instant) — no args: pick from blocked
 airlock blocked     list the URLs/hosts the proxy denied (not whitelisted)
-airlock down        stop & remove sandbox + proxy containers
+airlock guard on    catch npm/pnpm/yarn/npx/bun/node typed on the Mac (see below)
+airlock disk        what's using Docker's disk, per client volume
+airlock clean       free disk: leftovers, old builds, package caches (also daily, auto)
+  --stale / --deep  …also delete volumes unused 30 days / all build cache
+airlock down        stop & remove THIS project's sandbox + proxy
+airlock down --all  stop & remove every airlock project on this machine
+airlock off         down --all, then quit Docker Desktop (frees its RAM)
+airlock login       store a long-lived Claude token (no "Login expired")
+airlock logout      remove that token
 airlock status      show images, what's running, and whether it's SAFE
 airlock build       (re)build the images
 airlock rebuild     rebuild from scratch (no cache)
+airlock update      latest Node LTS, Claude Code, npm/pnpm, deploy CLIs (auto every 3 days)
 airlock logs        follow proxy logs live (watch what's allowed/blocked)
-airlock help        show help   (also --help, -h)
+airlock help        show every command   (also: plain `airlock`, --help, -h)
 ```
 
 Pass a one-off command instead of a shell: `airlock run npm test`,
@@ -249,13 +359,18 @@ on a terminal and auto-disable when piped.
   🔒 airlock · UNTRUSTED   safe — locked-down sandbox
   ────────────────────────────────────────────────────
   path      /Users/you/some/oss-project
-            ↳ mounted at /workspace — the only host folder the box can see
-  network   whitelist only · 27 domains allowed, everything else blocked
-  secrets   none of your files · Claude token only, no history
-  ports     3000 3001 5173 4000 8080 → http://localhost:<port> on your Mac
+  client    some · home volume airlock-home-some-untrusted
+            ↳ mounted at the same path — the only project folder the box can see
+  network   whitelist only · 36 domains allowed, everything else blocked
+  secrets   none of your files · Claude token only
+  sessions  saved on your Mac · ~/.claude/projects/-Users-you-some-oss-project · 3 so far · claude --resume
+  home      persistent · per-client volume — caches & logins survive
+  ports     1:1 3000-3005 4000 4173 4200 4321 5000-5001 5173-5175 6006 8000 8080-8081 8787 9000
+            ↳ e.g. http://localhost:3000 · no --host needed, localhost servers are forwarded
+  blocked   you get a macOS notification when a site is blocked · fix: airlock allow
   claude    logged in (synced from your Keychain)
   ────────────────────────────────────────────────────
-  type 'exit' to leave — the container is destroyed (fresh next spin)
+  type 'exit' to leave — container is destroyed; this client's home volume is kept
 ```
 
 ### `airlock status`
@@ -292,12 +407,29 @@ example.com           -> 403 blocked
 anything-not-listed   -> 403 blocked
 ```
 
-See what got blocked, then allow what you trust:
+**"The site doesn't load" in `run` is almost always the whitelist**, so airlock
+now tells you instead of failing silently:
+
+- a **macOS notification** the first time each host is blocked
+  (`AIRLOCK_NOTIFY=0` to mute);
+- on exit, a **list of everything blocked** that session.
+
+Then allow what you trust:
 ```bash
-airlock blocked          # lists denied hosts as URLs (works after exit too)
-airlock allow files.example.com
-airlock rebuild          # bake the new whitelist into the proxy image
+airlock allow                     # pick from what was blocked (numbers, or 'a')
+airlock allow files.example.com   # or name it — URLs/ports are fine, it keeps the host
+airlock blocked                   # the full denied list (works after exit too)
 ```
+The proxy matches the **host only**. A rule like `api.sanity.io:443` never
+matched anything; `airlock allow` now strips the scheme, port and path for you.
+
+Server-side code in Node (Next.js route handlers, `getServerSideProps`,
+`next/font`, CMS SDKs) used to ignore the proxy and fail with `fetch failed`
+even for whitelisted sites. `run` now sets `NODE_USE_ENV_PROXY=1`, which makes
+Node 24's `fetch`/`http` use it. Node versions installed with nvm older than
+24 don't support that.
+The filter is bind-mounted into the proxy, so no rebuild is needed; if no
+proxy is running, the change applies on the next `airlock run`.
 Example `airlock blocked` output:
 ```
   Denied — not on the whitelist:
@@ -306,7 +438,8 @@ Example `airlock blocked` output:
 ```
 
 Default whitelist: npm / yarn / pip / cargo, GitHub / GitLab, common deploy
-targets (Vercel, Netlify, Heroku, Cloudflare, Firebase), and Anthropic. Edit
+targets (Vercel, Netlify, Heroku, Cloudflare, Firebase), Anthropic, `nodejs.org`
+(for `nvm install`), `fonts.gstatic.com` (for `next/font`) and Sanity. Edit
 `proxy/filter` for bulk changes (one extended-regex per line, matched against
 the host). `airlock logs` shows what's being blocked.
 
@@ -365,8 +498,9 @@ one exits.)
 
 ## Multiple terminals
 
-Don't run `airlock run` twice — that starts a *second* container and collides on
-the published ports. Attach to the same one instead:
+Don't run `airlock run` twice in the same project — that starts a *second*
+container (its busy ports move to `1<port>`, so your URLs change).
+Attach to the same one instead:
 
 ```bash
 airlock run            # terminal 1: start it, run your app
@@ -377,28 +511,75 @@ airlock exec           # terminal 2, 3, …: jump into the SAME box
 
 ## Dev servers / ports
 
-Ports `3000`, `3001`, `5173`, `4000`, `8080` are forwarded to your Mac. **Bind
-your dev server to `0.0.0.0`**, not localhost, or the host can't reach it:
+Every well-known dev-server port is published automatically — nothing to
+configure, in both modes:
 
-```bash
-npm run dev -- -H 0.0.0.0         # Next.js / CRA
-npm run dev -- --host 0.0.0.0     # Vite
-```
-Then open `http://localhost:3000`. Need another port? Add it to `ports:` in
-`docker-compose.yml`, then `airlock build`.
+| Port(s) | Typically |
+|---|---|
+| `3000`–`3005` | Next.js, CRA, Remix, Nuxt, Express — and a 2nd/3rd app |
+| `4200` · `4000` | Angular · Gatsby / Phoenix / GraphQL |
+| `5173`–`5175` · `4173` | Vite (and the next ports it tries) · `vite preview` |
+| `4321` | Astro |
+| `5000` · `5001` | Flask, .NET, `serve` |
+| `6006` | Storybook |
+| `8000` | Django, FastAPI, Laravel |
+| `8080` · `8081` | misc / proxies · Expo / Metro |
+| `8787` | `wrangler dev` |
+| `9000` | misc |
+
+- **1:1 when free.** `localhost:3000` inside is `localhost:3000` on your Mac,
+  so the URL your dev server prints is the one to open.
+- **Only busy ports move.** If one is taken on your Mac (another project's box,
+  or macOS AirPlay on `5000`), just that port moves to `1<port>`, then
+  `2<port>`, … (`3000` → `13000`); the rest stay 1:1. The banner lists what moved.
+- **No `--host` flag needed.** A built-in forwarder relays dev servers that bind
+  only to `127.0.0.1` (the default for Vite, Next, Astro, …).
+- **Your Mac only.** Ports are published on `127.0.0.1`, so other machines on
+  your network can't reach what the sandbox is serving.
+
+Need more? Add a `.airlock-ports` file to the project (`7000 7001`), or set
+`AIRLOCK_EXTRA_PORTS="7000 7001"` for every project. `AIRLOCK_PORTS` replaces
+the default list entirely.
 
 ---
 
-## Claude login
+## Claude login & sessions
 
 `claude` is preinstalled and logged in in both modes. Because macOS keeps your
 Claude login in the **Keychain** (not a file), `airlock` exports it to
 `.secrets/.credentials.json` (chmod 600, git-ignored), mounts it read-only, and
-copies it into the container's ephemeral home. Token refreshes stay in the
-container and are **never written back** to your Mac.
+copies it into the sandbox's home. Token refreshes stay in the sandbox's home
+volume and are **never written back** to your Mac.
 
-- `dev` mode also mounts your `~/.claude` history; `run` mode mounts **only the
-  token** (no past conversations).
+**Recommended: `airlock login`, once.** That Keychain login shares one refresh
+token between your Mac and every sandbox, and each refresh invalidates the
+old one — so after a few hours a new sandbox could start with a dead token
+("Login expired · Please run /login"). `airlock login` runs `claude
+setup-token` and stores the long-lived token in your Keychain; sandboxes then
+get it as `CLAUDE_CODE_OAUTH_TOKEN`, which never refreshes and never fights
+your Mac. Without it, airlock keeps whichever copy was refreshed last.
+
+- `dev` mode uses your Mac's own Claude history and memory, read-write:
+  `~/.claude/projects/` (sessions + per-project memory), `file-history/`,
+  `history.jsonl` and `CLAUDE.md` are linked straight to the host. If your
+  `~/.claude/CLAUDE.md` is a symlink (e.g. into a rules repo), dev mounts the
+  real file it points to, read-write — the same text your Mac's Claude reads. The project
+  is mounted at the **same path** as on your Mac, so `claude --resume` sees the
+  same sessions on both sides, and they survive the container. The login token
+  and settings stay in the sandbox's volume.
+- `run` mode saves **this project's sessions on your Mac**, exactly where your
+  Mac's Claude keeps them: `~/.claude/projects/<project path>/`. Every project
+  has its own history, it survives `--rm` and `--ephemeral`, and
+  `claude --resume` / `claude --continue` work on both sides — start in the
+  sandbox, resume on the Mac, or the other way round. Only that one folder is
+  mounted: other projects' (other clients') sessions, your global prompt
+  history (`history.jsonl`) and file checkpoints never enter a `run` sandbox,
+  and the project's `memory/` is **read-only** inside, so untrusted code can't
+  plant instructions your Mac's Claude would load. CLAUDE.md is a read-only
+  copy refreshed every spin. Sessions an older airlock kept in the client
+  volume for the same path move to the Mac on the next spin; old ones from
+  the `/workspace` days (all projects mixed) stay in the volume.
+  `AIRLOCK_RUN_HISTORY=0` keeps `run` sessions in the client volume instead.
 - First run pops a **Keychain prompt** → click **Always Allow**.
 - If Claude says "Not logged in," run `/login` inside, or set `ANTHROPIC_API_KEY`
   before launching.
@@ -419,6 +600,10 @@ CPU/mem/PID caps).
   **`airlock sbx`**, which runs in a microVM with its own kernel.
 - **The project dir is read-write.** Untrusted code can modify files in the
   folder you opened (that's your project). It can't touch anything else.
+- **The home volume persists by default.** Anything untrusted code writes to
+  `/home/node` in `run` (a modified `~/.bashrc`, a fake binary on `PATH`) is
+  still there next `run` for that client. It can't reach `dev`'s home, but for
+  hostile code use `--ephemeral`, or `airlock reset` afterwards.
 - **Whitelisted domains are trusted.** If you `allow` a domain, code can talk to
   it; GitHub/npm can host arbitrary content. Keep the list tight.
 - **The Claude token is present in untrusted mode** (so `claude` works there).
@@ -426,6 +611,10 @@ CPU/mem/PID caps).
   whitelisted domain could in theory carry it out. If that matters: set
   `AIRLOCK_SEED_CLAUDE=0` for `untrusted` in `docker-compose.yml`. If a token is
   ever exposed, revoke it with `/logout` or rotate your login.
+- **`run` sessions are written to your Mac.** Untrusted code in the box can
+  read and edit that project's transcripts (never memory, never other
+  projects). A tampered transcript is untrusted text, like the project's own
+  files; be as careful resuming it as you are reading that code.
 - **Dev mode is not for untrusted code** — it has full internet and your
   history. Use `airlock run` for anything you don't trust.
 
@@ -439,13 +628,27 @@ CPU/mem/PID caps).
 ├── setup.sh             # one-shot restore on a fresh/reset Mac
 ├── Dockerfile           # sandbox image (Node + deploy CLIs + Claude)
 ├── docker-compose.yml   # two profiles (run/dev) + proxy + networks + limits
+├── docker-compose.home-persistent.yml  # default: per-client, per-mode home volume
+├── docker-compose.home-ephemeral.yml   # --ephemeral: tmpfs home, wiped on exit
 ├── entrypoint.sh        # seeds Claude login (token-only in run, full in dev)
 ├── in-container.sh      # `airlock` reminder shown inside the box
 ├── proxy/
 │   ├── Dockerfile       # tinyproxy image
 │   ├── tinyproxy.conf   # default-deny egress config
-│   └── filter           # the domain whitelist (edit / `airlock allow`)
-├── .secrets/            # exported Claude token (git-ignored, chmod 600)
+│   └── filter           # the domain whitelist (edit / `airlock allow`), bind-mounted
+├── shell/
+│   ├── guard.sh         # `airlock guard`: catches npm/pnpm/… typed on the Mac
+│   └── zshrc.zsh        # shared zsh setup (Mac + sandbox)
+├── sandbox/
+│   └── portforward.mjs  # relays loopback-bound dev servers to the host
+├── terminal/
+│   ├── make-profile.js  # builds the "Airlock" Terminal.app profile (font, spacing, cursor…)
+│   └── Airlock.terminal # the generated profile — `open` it to import
+├── statusline/
+│   └── statusline-command.sh  # Claude status bar baked into the image (dev)
+├── .secrets/            # exported Claude token + CLAUDE.md copy (git-ignored)
+├── .logs/               # last proxy log per project, for `airlock blocked`
+├── .state/              # volume last-used stamps, daily-clean marker (git-ignored)
 └── README.md
 ```
 

@@ -2,44 +2,68 @@
 #
 #   run  (profile: run)  -> UNTRUSTED projects. No host secrets. No direct
 #                           internet: egress only via the whitelist proxy.
-#   dev  (profile: dev)  -> YOUR code. Claude login seeded in. Full internet.
+#   dev  (profile: dev)  -> YOUR code. Full internet.
 #
-# Use via the `airlock` wrapper, which sets WORKSPACE + the right profile.
+# Use via the `airlock` wrapper, which sets WORKSPACE, the compose project
+# name, the published dev ports, and the right profile.
+#
+# NOTE: the /home/node mount is deliberately NOT declared here. The wrapper
+# always layers exactly one of:
+#   docker-compose.home-persistent.yml   per-client named volume  (default)
+#   docker-compose.home-ephemeral.yml    tmpfs, wiped on exit     (--ephemeral)
 
 # Shared hardening applied to both sandbox profiles.
 x-sandbox-common: &sandbox-common
   image: syedtasavour/airlock-sandbox:latest
   build:
     context: .
+    args:
+      # latest Node LTS unless you pin a major: AIRLOCK_NODE_VERSION=24 airlock update
+      NODE_VERSION: ${AIRLOCK_NODE_VERSION:-lts}
   stdin_open: true
   tty: true
+  # tini as PID 1: reaps the zombies dev servers leave behind over a long
+  # session, and lets `docker stop`/`rm -f` end the box instantly instead of
+  # waiting out bash-as-PID-1 ignoring SIGTERM.
+  init: true
 
-  # cannot write to the root filesystem; only the tmpfs mounts below are writable
+  # cannot write to the root filesystem; only the mounts below are writable
   read_only: true
   security_opt:
     - no-new-privileges:true
   cap_drop:
     - ALL
 
-  # writable scratch (RAM-backed, wiped on stop)
+  # writable scratch (RAM-backed, wiped on stop). 256m was too small: Next/Vite
+  # builds, esbuild and pnpm all spill into /tmp and died with "ENOSPC: no space
+  # left on device". tmpfs only uses RAM for what is actually written, and it
+  # counts against mem_limit, so a bigger cap costs nothing while idle.
   tmpfs:
-    - /tmp:size=256m
-    - /home/node:exec,uid=1000,gid=1000,size=1g
+    - /tmp:size=1g
 
-  # resource caps: blunt the impact of fork bombs / runaway untrusted code
+  # Container logs live on Docker's disk. A dev server or the proxy (LogLevel
+  # Info logs every connection) left running for days grew them without bound.
+  logging: &airlock-logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "2"
+
+  # Resource policy:
+  #   mem_limit  a CAP, not a reservation: an idle box uses what it uses. 2500m
+  #              gave Node a 1442 MiB heap and builds died with "JavaScript heap
+  #              out of memory"; 4g plus NODE_OPTIONS below gives them 3 GiB.
+  #   cpus       deliberately UNSET — builds and installs run at full speed.
+  #   pids_limit still blocks fork bombs; that's process count, not CPU share.
   mem_limit: 4g
-  cpus: 4
   pids_limit: 512
 
   working_dir: /workspace
 
-  # dev-server ports forwarded to the host (published only with --service-ports)
-  ports:
-    - "3000:3000"   # Next.js / CRA
-    - "3001:3001"   # second app
-    - "5173:5173"   # Vite
-    - "4000:4000"   # misc
-    - "8080:8080"   # misc / proxies
+  # NOTE: no `ports` here or in the services. At each launch the wrapper
+  # probes ~20 well-known dev ports (3000-3005, 4200, 5173, 8000, …), maps each
+  # one 1:1 when it's free on your Mac and moves only the busy ones, then
+  # layers the result on as .state/ports/<project>-<mode>.yml (127.0.0.1 only).
 
 services:
   # ---- egress whitelist proxy (only started for the `run` profile) ----------
@@ -47,10 +71,16 @@ services:
     build:
       context: ./proxy
     image: syedtasavour/airlock-proxy:latest
-    container_name: airlock-proxy
     profiles: [run]
     networks: [egress, isolated]
-    restart: unless-stopped
+    # on-failure, not unless-stopped: an orphaned proxy must not come back
+    # every time Docker starts, or the VM never idles and never frees its RAM.
+    restart: on-failure
+    logging: *airlock-logging
+    # The whitelist is MOUNTED, not baked into the image: `airlock allow` now
+    # takes effect on a proxy restart (seconds) instead of a full rebuild.
+    volumes:
+      - ./proxy/filter:/etc/tinyproxy/filter:ro
 
   # ---- UNTRUSTED mode -------------------------------------------------------
   untrusted:
@@ -59,37 +89,95 @@ services:
     # ONLY the internal network -> no direct route to the internet.
     networks: [isolated]
     depends_on: [proxy]
+    # Same absolute path as on your Mac (like dev), not /workspace. Claude
+    # files sessions by working directory, so this is what gives each project
+    # its own history — under /workspace every project shared one.
+    working_dir: ${WORKSPACE:-/workspace}
     environment:
       - HOME=/home/node
       - AIRLOCK_SEED_CLAUDE=1      # log Claude in (token only — see volumes)
+      - AIRLOCK_SANDBOX=run        # statusline badge
+      - AIRLOCK_STATUSLINE=1       # same Claude status line as your Mac (baked copy)
+      - AIRLOCK_FORWARD_PORTS      # every published port, set by the wrapper
+      - TZ=${AIRLOCK_TZ:-UTC}      # your Mac's time zone (status line, logs, `date`)
+      - AIRLOCK_FORWARD=1          # reach loopback-bound dev servers, no --host
+      - NODE_OPTIONS=--max-old-space-size=3072
+      # Long-lived token from `airlock login`, passed through from the wrapper
+      # (unset -> falls back to the Keychain OAuth copy).
+      - CLAUDE_CODE_OAUTH_TOKEN
       # force all egress through the whitelist proxy
       - HTTP_PROXY=http://proxy:8888
       - HTTPS_PROXY=http://proxy:8888
       - http_proxy=http://proxy:8888
       - https_proxy=http://proxy:8888
-      - NO_PROXY=localhost,127.0.0.1,proxy
-      - no_proxy=localhost,127.0.0.1,proxy
+      - NO_PROXY=localhost,127.0.0.1,0.0.0.0,::1,proxy
+      - no_proxy=localhost,127.0.0.1,0.0.0.0,::1,proxy
+      # Node's built-in fetch() and http ignore HTTP(S)_PROXY unless told to.
+      # Without this, server-side fetches in Next.js (getServerSideProps, route
+      # handlers, next/font, CMS SDKs) tried a direct connection, which the
+      # internal network has no route for -> "fetch failed" even for
+      # whitelisted sites. Node 24 honours it; older nvm versions don't.
+      - NODE_USE_ENV_PROXY=1
+      # Telemetry hosts aren't whitelisted; don't spam the blocked list.
+      - NEXT_TELEMETRY_DISABLED=1
+      # Claude's folder name for this project (path with non-alphanumerics as
+      # "-"), set by the wrapper. entrypoint.sh links it to /host-sessions.
+      - AIRLOCK_SESSION_KEY
     volumes:
-      # The project you opened.
-      - ${WORKSPACE:-.}:/workspace
-      # ONLY the Claude login token — NOT your ~/.claude history or .claude.json.
-      # Claude works; your past conversations stay off the untrusted box.
+      # The project you opened, at the same path it has on your Mac.
+      - ${WORKSPACE:-.}:${WORKSPACE:-/workspace}
+      # THIS project's Claude sessions, saved straight to your Mac's
+      # ~/.claude/projects/<this-project>/ — so they survive the container,
+      # show up in `claude --resume` on the Mac, and vice versa. Only this one
+      # folder: other projects' (other clients') sessions, your global prompt
+      # history and file checkpoints are never visible in here.
+      - ${AIRLOCK_SESSIONS_DIR:-./.state/no-sessions}:/host-sessions
+      # ...with its memory/ READ-ONLY. Your Mac's Claude loads that memory
+      # automatically, so untrusted code must never be able to write it.
+      - ${AIRLOCK_SESSIONS_DIR:-./.state/no-sessions}/memory:/host-sessions/memory:ro
+      # The Claude login token.
       - ./.secrets/.credentials.json:/host-claude-creds.json:ro
+      # Your global ~/.claude/CLAUDE.md, staged by the wrapper. READ-ONLY:
+      # untrusted code must never be able to rewrite your standing instructions.
+      - ./.secrets/CLAUDE.md:/host-claude-md:ro
 
   # ---- DEV (trusted) mode ---------------------------------------------------
   dev:
     <<: *sandbox-common
     profiles: [dev]
     networks: [egress]            # full internet
+    # The project is mounted at the SAME absolute path it has on your Mac, not
+    # /workspace. Claude keys history and memory by cwd
+    # (~/.claude/projects/-Users-you-Code-app), so this is what makes a session
+    # started here resumable on the Mac, and the Mac's sessions resumable here.
+    working_dir: ${WORKSPACE:-/workspace}
     environment:
       - HOME=/home/node
-      - AIRLOCK_SEED_CLAUDE=1      # seed Claude login/session
+      - AIRLOCK_SEED_CLAUDE=1      # seed Claude login
+      # Statusline from the image's baked copy (/opt/airlock) — the same
+      # script your Mac runs. No host path is involved.
+      - AIRLOCK_STATUSLINE=1
+      - AIRLOCK_SANDBOX=dev        # statusline badge
+      - AIRLOCK_FORWARD_PORTS      # every published port, set by the wrapper
+      - TZ=${AIRLOCK_TZ:-UTC}      # your Mac's time zone (status line, logs, `date`)
+      - AIRLOCK_FORWARD=1          # reach loopback-bound dev servers, no --host
+      - AIRLOCK_HOST_CLAUDE=1      # history + memory live in the Mac's ~/.claude
+      - NODE_OPTIONS=--max-old-space-size=3072
+      - CLAUDE_CODE_OAUTH_TOKEN    # from `airlock login` (see untrusted)
     volumes:
-      - ${WORKSPACE:-.}:/workspace
-      # Claude host login/session, READ-ONLY, copied into the ephemeral home.
-      - ${HOME}/.claude:/host-claude:ro
-      - ${HOME}/.claude.json:/host-claude.json:ro
+      - ${WORKSPACE:-.}:${WORKSPACE:-/workspace}
       - ./.secrets/.credentials.json:/host-claude-creds.json:ro
+      # Your Mac's ~/.claude, READ-WRITE. entrypoint.sh links only the history
+      # and memory parts into the sandbox home (projects/, file-history/,
+      # history.jsonl, CLAUDE.md), so sessions survive the container and show
+      # up on the Mac. Settings, plugins and the login token stay in this
+      # client's volume. dev only: untrusted code must never be able to write
+      # memory or CLAUDE.md that your Mac's Claude will later follow.
+      - ${HOME}/.claude:/host-claude
+      # Your global CLAUDE.md, read-write: the REAL file behind
+      # ~/.claude/CLAUDE.md (symlinks resolved by the wrapper), so edits made
+      # in here land in it and the Mac's Claude and this one read the same text.
+      - ${AIRLOCK_CLAUDE_MD_FILE:-./.secrets/CLAUDE.md}:/host-claude-md-rw
 
 networks:
   egress:

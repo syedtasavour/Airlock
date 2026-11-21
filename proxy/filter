@@ -1,6 +1,8 @@
 # airlock egress whitelist — one extended-regex per line, matched against the
 # destination HOST. Anything not listed here is BLOCKED for the sandbox.
-# Add domains with:  airlock allow <domain>   (or edit this file, then rebuild).
+# Add domains with:  airlock allow <domain>   (or edit this file; the
+# proxy re-reads it on restart — no rebuild). Match is on the HOST only: never
+# put a port, scheme or path in a rule.
 # Lines starting with # are comments.
 
 # --- package registries (so projects can install deps) ---
@@ -33,7 +35,27 @@
 \.firebaseio\.com$
 \.googleapis\.com$
 
-# --- Claude / Anthropic (only relevant in dev mode) ---
+# --- Claude / Anthropic (applies in `run`; `dev` has full internet) ---
 \.anthropic\.com$
 ^api\.anthropic\.com$
+# OAuth: authorize page, token exchange/refresh, client metadata.
+# Without these the mounted host token cannot refresh and Claude falls back
+# to an interactive /login inside the sandbox.
+^claude\.ai$
 \.claude\.ai$
+^claude\.com$
+^platform\.claude\.com$
+
+# --- common runtime downloads (things that broke ordinary projects) ---
+# Node binaries for `nvm install <ver>`.
+^nodejs\.org$
+# next/font/google fetches font files from here at dev/build time.
+^fonts\.gstatic\.com$
+
+# --- Sanity CMS ---
+# These were added as "api.sanity.io:443", which never matched: the proxy
+# compares the HOST ONLY, without the port. `airlock allow` now strips ports.
+^api\.sanity\.io$
+\.api\.sanity\.io$
+\.apicdn\.sanity\.io$
+^cdn\.sanity\.io$

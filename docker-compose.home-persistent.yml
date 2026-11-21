@@ -1,0 +1,26 @@
+# Layered by the `airlock` wrapper by DEFAULT.
+#
+# Each CLIENT gets a home volume PER MODE. The split is a security boundary,
+# not tidiness: untrusted code must never be able to leave something in a home
+# that `airlock dev` later executes with full internet and your Claude token.
+# A poisoned ~/.bashrc, a shim dropped in ~/.local/bin, or a tampered pnpm
+# store written from `run` stays quarantined in the untrusted volume.
+#
+# Within a mode, caches and Claude history persist across spins, and are never
+# shared with another client.
+#
+# Wipe:  airlock reset [client]      (both volumes for that client)
+#        airlock run --fresh          (just the mode you're launching)
+services:
+  untrusted:
+    volumes:
+      - airlock-home-untrusted:/home/node
+  dev:
+    volumes:
+      - airlock-home-dev:/home/node
+
+volumes:
+  airlock-home-untrusted:
+    name: airlock-home-${AIRLOCK_CLIENT:-default}-untrusted
+  airlock-home-dev:
+    name: airlock-home-${AIRLOCK_CLIENT:-default}-dev

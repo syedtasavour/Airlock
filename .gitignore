@@ -10,3 +10,6 @@
 *.dmg
 *.log
 .logs/
+
+# Host-side state: volume last-used stamps, auto-clean marker
+.state/
